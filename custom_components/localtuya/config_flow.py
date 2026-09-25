@@ -44,11 +44,21 @@ from homeassistant.const import (
 
 from .coordinator import HassLocalTuyaData
 from .core import pytuya
+from .core.pytuya import TIMEOUT_CONNECT
 from .core.cloud_api import TUYA_ENDPOINTS, TuyaCloudApi
-from .core.helpers import templates, get_gateway_by_deviceid, gen_localtuya_entities
+from .core.helpers import (
+    templates,
+    get_gateway_by_deviceid,
+    gen_localtuya_entities,
+    find_discovered_by_ip,
+    gateway_children,
+    discovered_from_gateway,
+    sleep_time_for_category,
+)
 from .const import (
     ATTR_UPDATED_AT,
     CONF_ADD_DEVICE,
+    CONF_ADD_GATEWAY,
     CONF_CONFIGURE_CLOUD,
     CONF_DPS_STRINGS,
     CONF_EDIT_DEVICE,
@@ -93,7 +103,19 @@ TUYA_CATEGORY = "category"
 DEVICE_CLOUD_DATA = "device_cloud_data"
 
 # Using list method so we can translate options.
-CONFIGURE_MENU = [CONF_ADD_DEVICE, CONF_EDIT_DEVICE, CONF_CONFIGURE_CLOUD]
+CONFIGURE_MENU = [
+    CONF_ADD_DEVICE,
+    CONF_ADD_GATEWAY,
+    CONF_EDIT_DEVICE,
+    CONF_CONFIGURE_CLOUD,
+]
+
+ADD_GATEWAY_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_HOST): cv.string,
+        vol.Optional(CONF_TUYA_GWID, default=""): cv.string,
+    }
+)
 
 
 def col_to_select(
@@ -267,6 +289,8 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         self.entities = []
         self.use_template = False
         self.template_device = None
+        self._gateway_task: asyncio.Task | None = None
+        self._gateway_result: dict | None = None
 
     @property
     def localtuya_data(self) -> HassLocalTuyaData:
@@ -402,6 +426,159 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             step_id="add_device",
             data_schema=devices_schema(devices, self.cloud_data.device_list),
             errors=errors,
+        )
+
+    async def async_step_add_gateway(self, user_input=None):
+        """Onboard every Zigbee/BLE sub-device of one gateway, given its LAN IP.
+
+        A hub relays each query to a Zigbee child and answers in seconds, so a
+        hub with dozens of children takes minutes to enumerate. That work runs
+        as a background task behind a progress step: doing it inline held one
+        HTTP request open for the whole time, and whoever gave up first (a
+        proxy, the browser) cancelled the onboarding halfway through.
+        """
+        if self._gateway_task is not None:
+            if not self._gateway_task.done():
+                return self.async_show_progress(
+                    step_id="add_gateway",
+                    progress_action="onboard_gateway",
+                    progress_task=self._gateway_task,
+                )
+            return self.async_show_progress_done(next_step_id="gateway_result")
+
+        errors = {}
+        placeholders = {}
+        if user_input is not None:
+            host = user_input[CONF_HOST].strip()
+            gw_id = (user_input.get(CONF_TUYA_GWID) or "").strip()
+
+            if self.config_entry.data.get(CONF_NO_CLOUD, True):
+                errors["base"] = "cloud_required"
+            else:
+                data = self.hass.data.get(DOMAIN, {})
+                discovered = (
+                    data[DATA_DISCOVERY].devices if DATA_DISCOVERY in data else {}
+                )
+                found = find_discovered_by_ip(discovered, host)
+                if found:
+                    gw_id = gw_id or found.get(CONF_TUYA_GWID, "")
+                if not gw_id:
+                    errors["base"] = "gateway_not_discovered"
+
+            if not errors:
+                self._gateway_task = self.hass.async_create_task(
+                    self._async_onboard_gateway(host, gw_id, found)
+                )
+                return self.async_show_progress(
+                    step_id="add_gateway",
+                    progress_action="onboard_gateway",
+                    progress_task=self._gateway_task,
+                )
+
+        return self.async_show_form(
+            step_id="add_gateway",
+            data_schema=schema_suggested_values(
+                ADD_GATEWAY_SCHEMA, **(user_input or {})
+            ),
+            errors=errors,
+            description_placeholders=placeholders,
+        )
+
+    async def _async_onboard_gateway(self, host: str, gw_id: str, found: dict | None):
+        """Background half of add_gateway; stores its outcome for the next step."""
+        version = str(found.get(CONF_TUYA_VERSION, "auto")) if found else "auto"
+        product_key = found.get("productKey") if found else None
+
+        await self.cloud_data.async_get_devices_list(force_update=True)
+        cloud_devs = self.cloud_data.device_list
+        if gw_id not in cloud_devs:
+            self._gateway_result = {"error": "gateway_not_in_cloud", "gw_id": gw_id}
+            return
+        children = gateway_children(gw_id, cloud_devs)
+        if not children:
+            self._gateway_result = {"error": "no_sub_devices", "gw_id": gw_id}
+            return
+
+        # Pull DP specs only for the children, not the whole account.
+        await asyncio.gather(
+            *(
+                self.cloud_data.async_get_device_functions(dev_id)
+                for dev_id in children
+            ),
+            return_exceptions=True,
+        )
+        discovered_children = discovered_from_gateway(
+            host, gw_id, version, product_key, children
+        )
+        session = GatewaySession(self.localtuya_data, host)
+        await session.open(gw_id, cloud_devs[gw_id].get(CONF_LOCAL_KEY), version)
+        if session.connected and version == "auto":
+            version = str(session._interface.version)
+            for child in discovered_children.values():
+                child[CONF_TUYA_VERSION] = version
+        try:
+            devices, fails = await setup_localtuya_devices(
+                self.hass,
+                self.localtuya_data,
+                discovered_children,
+                cloud_devs,
+                log_fails=True,
+            )
+        finally:
+            await session.close()
+
+        self._gateway_result = {
+            "devices": devices,
+            "fails": fails,
+            "gw_name": cloud_devs[gw_id].get(CONF_NAME, gw_id),
+            "gw_id": gw_id,
+            "host": host,
+            "version": version,
+            "total": len(children),
+        }
+
+    async def async_step_gateway_result(self, user_input=None):
+        """Report what the background onboarding found."""
+        result, self._gateway_result = self._gateway_result, None
+        self._gateway_task = None
+
+        if result is None or "error" in result:
+            errors = {"base": (result or {}).get("error", "unknown")}
+            return self.async_show_form(
+                step_id="add_gateway",
+                data_schema=ADD_GATEWAY_SCHEMA,
+                errors=errors,
+                description_placeholders={"gw_id": (result or {}).get("gw_id", "")},
+            )
+
+        devices, fails = result["devices"], result["fails"]
+        ok_lines = "".join(
+            f"\n{d[CONF_FRIENDLY_NAME]} (node {d.get(CONF_NODE_ID)})"
+            for d in devices.values()
+        )
+        fail_lines = "".join(f"\n{f['name']}: {f['reason']}" for f in fails.values())
+        skipped = result["total"] - len(devices) - len(fails)
+        msg = (
+            f"Gateway: ``{result['gw_name']}`` ({result['host']}, id {result['gw_id']}, "
+            f"protocol {result['version']})\n"
+            f"Succeeded sub-devices: ``{len(devices)}``\n ```{ok_lines}\n```"
+        )
+        if fails:
+            msg += f" \n Failed sub-devices: ``{len(fails)}``\n ```{fail_lines}\n```"
+        if skipped > 0:
+            msg += f"\nAlready configured (skipped): ``{skipped}``"
+        if not devices:
+            msg += (
+                "\nNothing to add. Press a button on each sub-device (or power-cycle "
+                "the gateway) so they report once, then retry."
+            )
+            return await self.async_step_confirm(
+                msg=msg, confirm_callback=lambda: self.async_step_init()
+            )
+        msg += "\nClick on submit to add the devices"
+        return await self.async_step_confirm(
+            msg=msg,
+            confirm_callback=lambda: self._update_entry(devices, CONF_DEVICES),
         )
 
     async def async_step_edit_device(self, user_input=None):
@@ -929,6 +1106,9 @@ async def setup_localtuya_devices(
                 CONF_ENABLE_DEBUG: False,
                 CONF_NODE_ID: dev_cloud_data.get(CONF_NODE_ID),
                 CONF_MODEL: dev_cloud_data.get(CONF_MODEL),
+                CONF_DEVICE_SLEEP_TIME: sleep_time_for_category(
+                    dev_cloud_data.get(TUYA_CATEGORY, "")
+                ),
                 CONF_PRODUCT_KEY: data.get("productKey"),
             }
             # If device is sub and has Gateway ID store gatewayID
@@ -939,8 +1119,22 @@ async def setup_localtuya_devices(
             devices_cfg.append(device_data)
 
     # Connect to the devices to ensure the are usable.
-    validate_devices = [validate_input(localtuya_data, dev) for dev in devices_cfg]
-    results = await asyncio.gather(*validate_devices, return_exceptions=True)
+    # Parents in parallel; sub-devices one at a time, because they share the
+    # gateway's single connection and a gateway serialises child queries.
+    parents = [dev for dev in devices_cfg if not dev.get(CONF_NODE_ID)]
+    children = [dev for dev in devices_cfg if dev.get(CONF_NODE_ID)]
+    parent_results = await asyncio.gather(
+        *(validate_input(localtuya_data, dev) for dev in parents),
+        return_exceptions=True,
+    )
+    child_results = []
+    for dev in children:
+        try:
+            child_results.append(await validate_input(localtuya_data, dev))
+        except Exception as ex:  # pylint: disable=broad-except
+            child_results.append(ex)
+    devices_cfg = parents + children
+    results = list(parent_results) + child_results
 
     # Merge test results with devices config
     for dev_cfg, result in zip(devices_cfg, results):
@@ -1192,6 +1386,119 @@ def flow_schema(platform, dps_strings):
     return import_module("." + platform, integration_module).flow_schema(dps_strings)
 
 
+GATEWAY_CONNECT_ATTEMPTS = 4
+GATEWAY_CONNECT_RETRY_DELAY = 1.5
+
+
+class GatewaySession:
+    """One LAN connection to a gateway, shared by every sub-device validation.
+
+    Registered under the gateway IP in the entry runtime so validate_input()
+    picks it up instead of opening a socket per child. Tuya gateways accept
+    1 to 3 local clients: validating 50 children with 50 sockets would reset
+    the gateway (and, on a Matter bridge, every device behind it).
+    """
+
+    def __init__(self, entry_runtime: HassLocalTuyaData, host: str):
+        self._runtime = entry_runtime
+        self.host = host
+        self._interface = None
+        self._registered = False
+
+    @property
+    def connected(self):
+        return bool(self._interface and self._interface.is_connected)
+
+    @property
+    def is_connecting(self):
+        return False
+
+    async def open(self, gw_id: str, local_key: str, version: str, enable_debug=False):
+        """Open the shared session, retrying a refused first attempt.
+
+        A hub that has had no LAN client for a while answers the first
+        connect with EHOSTUNREACH and accepts the next one (observed on a
+        Zemismart M1). Giving up there is expensive: every sub-device then
+        opens a socket of its own, which is slow and hammers the hub.
+        """
+        if self._runtime.devices.get(self.host):
+            return self  # a real TuyaDevice already holds the connection
+        versions = [version] if version != "auto" else list(SUPPORTED_PROTOCOL_VERSIONS)
+        for attempt in range(1, GATEWAY_CONNECT_ATTEMPTS + 1):
+            for ver in versions:
+                try:
+                    async with asyncio.timeout(TIMEOUT_CONNECT + 2):
+                        iface = await pytuya.connect(
+                            self.host, gw_id, local_key, float(ver), enable_debug
+                        )
+                except Exception as ex:  # pylint: disable=broad-except
+                    _LOGGER.info(
+                        "Gateway %s: connect on %s failed (attempt %s): %s",
+                        self.host,
+                        ver,
+                        attempt,
+                        ex,
+                    )
+                    continue
+                # The session-key handshake happens on the first exchange. Use
+                # the sub-device online list for it on 3.4+; the reply itself
+                # is optional (some hubs ignore the query but still serve cid
+                # status requests), so only a dead socket rules a version out.
+                try:
+                    if float(ver) >= 3.4:
+                        await iface.subdevices_query()
+                except Exception as ex:  # pylint: disable=broad-except
+                    _LOGGER.debug(
+                        "Gateway %s: sub-device query on %s: %s", self.host, ver, ex
+                    )
+                if not iface.is_connected:
+                    await iface.close()
+                    _LOGGER.info("Gateway %s: handshake on %s refused", self.host, ver)
+                    continue
+                _LOGGER.info(
+                    "Gateway %s: shared session on protocol %s", self.host, ver
+                )
+                self._interface = iface
+                self._runtime.devices[self.host] = self
+                self._registered = True
+                return self
+            await asyncio.sleep(GATEWAY_CONNECT_RETRY_DELAY * attempt)
+        _LOGGER.warning(
+            "Gateway %s: no shared session; each sub-device will connect on its own",
+            self.host,
+        )
+        return self
+
+    async def close(self):
+        if self._registered and self._runtime.devices.get(self.host) is self:
+            self._runtime.devices.pop(self.host, None)
+        self._registered = False
+        if self._interface:
+            await self._interface.close()
+            self._interface = None
+
+
+async def nudge_subdevice_dps(interface, cid: str, logger, wait: float = 2.0) -> dict:
+    """Ask the gateway to refresh a child's DPs, then return what it reported."""
+    logger.info("No DPs from sub-device %s, requesting a refresh via the gateway", cid)
+    try:
+        # Same ranges detect_available_dps() probes; unknown DP IDs are ignored.
+        await interface.update_dps(dps=[*range(1, 31), *range(100, 111)], cid=cid)
+        await asyncio.sleep(wait)
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.debug(f"DP refresh through the gateway failed: {ex}")
+
+    if dps := interface.dps_cache.get(cid, {}):
+        return dps
+
+    # Not every hub pushes the refreshed state, so ask for it once more.
+    try:
+        return await interface.status(cid=cid)
+    except Exception as ex:  # pylint: disable=broad-except
+        logger.debug(f"Retried status for {cid} failed: {ex}")
+        return {}
+
+
 async def validate_input(entry_runtime: HassLocalTuyaData, data):
     """Validate the user input allows us to connect."""
     logger = pytuya.ContextualLogger()
@@ -1281,7 +1588,19 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
 
             # Detect any other non-manual DPS strings
             if not detected_dps:
-                detected_dps = await interface.detect_available_dps(cid=cid)
+                try:
+                    detected_dps = await interface.detect_available_dps(cid=cid)
+                except Exception as ex:  # pylint: disable=broad-except
+                    # A busy hub drops the odd child query. That must not skip
+                    # the retry below, which is what recovers the child.
+                    logger.info(f"First DP query failed, will retry: {ex}")
+                    detected_dps = {}
+
+            if cid and not detected_dps:
+                # A Zigbee/BLE child that hasn't reported since the gateway
+                # booted answers a DP query with nothing. Ask the gateway to
+                # refresh the child's DPs and read what it pushes back.
+                detected_dps = await nudge_subdevice_dps(interface, cid, logger)
 
         except (ValueError, pytuya.parser.DecodeError) as ex:
             error = ex
@@ -1321,6 +1640,21 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
     cloud_data = entry_runtime.cloud_data
     if (dev_id := data.get(CONF_DEVICE_ID)) in cloud_data.device_list:
         cloud_dp_codes = await cloud_data.async_get_device_functions(dev_id)
+
+    # A battery child (motion, door, leak, scene switch...) reports once and
+    # then sleeps, so it usually cannot answer while it is being set up. When
+    # the cloud describes its DPs, build the entities from that instead of
+    # refusing to add the device at all.
+    if (
+        not detected_dps_device
+        and cloud_dp_codes
+        and data.get(CONF_DEVICE_SLEEP_TIME, 0) > 0
+    ):
+        logger.info(
+            "Sleeping device did not answer; using the %s DPs the cloud describes",
+            len(cloud_dp_codes),
+        )
+        bypass_handshake = True
 
     # Indicate an error if no datapoints found as the rest of the flow
     # won't work in this case

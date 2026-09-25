@@ -611,6 +611,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             color_mode = self._modes.white
             states[self._config.get(CONF_BRIGHTNESS)] = brightness
 
+        # Never send contradictory DPs in one command. A bulb asked to go to
+        # white/colour-temp must not also receive colour data (and a bulb asked
+        # for a colour must not receive a colour temperature), otherwise some
+        # firmwares stay in the previous work mode and ignore the rest.
+        if color_mode == self._modes.white:
+            states.pop(self._config.get(CONF_COLOR), None)
+        elif color_mode == self._modes.color:
+            states.pop(self._config.get(CONF_COLOR_TEMP), None)
+
         if color_mode is not None:
             states[self._config.get(CONF_COLOR_MODE)] = color_mode
 

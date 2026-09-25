@@ -91,7 +91,7 @@ class templates:
 ##       config flows         ##
 ################################
 
-from ..const import CONF_LOCAL_KEY, CONF_NODE_ID
+from ..const import CONF_GATEWAY_ID, CONF_LOCAL_KEY, CONF_NODE_ID
 
 GATEWAY = NamedTuple("Gateway", [("id", str), ("data", dict)])
 
@@ -108,6 +108,91 @@ def get_gateway_by_deviceid(device_id: str, cloud_data: dict) -> GATEWAY:
                 and dev_data.get(CONF_LOCAL_KEY) == sub_device.get(CONF_LOCAL_KEY)
             ):
                 return GATEWAY(dev_id, dev_data)
+
+
+###############################
+#   Gateway onboarding        #
+###############################
+INFRARED_PREFIX = "infrared"
+
+
+def find_discovered_by_ip(discovered: dict, host: str) -> dict | None:
+    """Return the UDP-discovered device that announced itself from `host`."""
+    for dev in (discovered or {}).values():
+        if dev.get("ip") == host:
+            return dev
+    return None
+
+
+def gateway_children(gateway_id: str, cloud_devices: dict) -> dict[str, dict]:
+    """Return the cloud devices that hang off `gateway_id`.
+
+    Tuya returns a sub-device with the SAME local key as its gateway and a
+    `node_id` (Zigbee/BLE cid). Some data centers also fill `gateway_id`;
+    when they do, trust it over the key match. IR remotes are excluded:
+    they are virtual children of an IR blaster, not Zigbee devices.
+    """
+    gateway = cloud_devices.get(gateway_id)
+    if not gateway:
+        return {}
+    gw_key = gateway.get(CONF_LOCAL_KEY)
+    children = {}
+    for dev_id, dev in cloud_devices.items():
+        if dev_id == gateway_id or not dev.get(CONF_NODE_ID):
+            continue
+        if str(dev.get("category", "")).startswith(INFRARED_PREFIX):
+            continue
+        explicit_gw = dev.get("gateway_id")
+        if explicit_gw:
+            if explicit_gw == gateway_id:
+                children[dev_id] = dev
+        elif gw_key and dev.get(CONF_LOCAL_KEY) == gw_key:
+            children[dev_id] = dev
+    return children
+
+
+# Categories that are battery powered by definition: they report and then
+# sleep, so they cannot be expected to answer a query during setup.
+SLEEPY_CATEGORIES = {
+    "pir",  # motion sensor
+    "mcs",  # door/window sensor
+    "wsdcg",  # temperature/humidity sensor
+    "sj",  # water leak sensor
+    "ywbj",  # smoke sensor
+    "rqbj",  # gas sensor
+    "sos",  # emergency button
+    "wxkg",  # scene/wireless switch
+    "ms",  # lock
+    "znhsj",  # soil sensor
+}
+DEFAULT_SLEEP_TIME = 1800
+
+
+def sleep_time_for_category(category: str) -> int:
+    """Seconds of silence to tolerate from a child of this category."""
+    return DEFAULT_SLEEP_TIME if category in SLEEPY_CATEGORIES else 0
+
+
+def discovered_from_gateway(
+    host: str,
+    gateway_id: str,
+    version: str,
+    product_key: str | None,
+    children: dict[str, dict],
+) -> dict[str, dict]:
+    """Shape gateway children like UDP-discovered devices so the normal
+    auto-configure path (setup_localtuya_devices) can consume them."""
+    return {
+        dev_id: {
+            "ip": host,
+            "gwId": dev_id,
+            "version": version,
+            "productKey": product_key,
+            CONF_NODE_ID: dev.get(CONF_NODE_ID),
+            CONF_GATEWAY_ID: gateway_id,
+        }
+        for dev_id, dev in children.items()
+    }
 
 
 ###############################

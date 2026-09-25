@@ -23,7 +23,7 @@
             },
             "power_outlet": {
                 "title": "Add subswitch",
-		"description": "You are about to add subswitch number `{number}`. If you want to add another, tick `Add another switch` before continuing.",
+                "description": "You are about to add subswitch number `{number}`. If you want to add another, tick `Add another switch` before continuing.",
                 "data": {
                     "id": "ID",
                     "name": "Name",
@@ -46,6 +46,9 @@
                     "edit_device": "Edit a device",
                     "delete_device": "Delete a device",
                     "setup_cloud": "Reconfigure Cloud API account"
+                },
+                "menu_options": {
+                    "add_gateway": "Onboard a gateway and all its sub-devices (by IP)"
                 }
             },
             "entity": {
@@ -104,7 +107,7 @@
                     "fan_speed_min": "minimum fan speed integer",
                     "fan_speed_max": "maximum fan speed integer",
                     "fan_speed_ordered_list": "Fan speed modes list (overrides speed min/max)",
-                    "fan_direction":"fan direction dps",
+                    "fan_direction": "fan direction dps",
                     "fan_direction_forward": "forward dps string",
                     "fan_direction_reverse": "reverse dps string",
                     "fan_dps_type": "DP value type",
@@ -135,7 +138,24 @@
             "yaml_import": {
                 "title": "Not Supported",
                 "description": "Options cannot be edited when configured via YAML."
+            },
+            "add_gateway": {
+                "title": "Onboard gateway sub-devices",
+                "description": "Enter the LAN IP of a Tuya Zigbee/BLE gateway that is already paired in your (OEM) Tuya app. LocalTuya identifies it from its UDP broadcast, fetches its local key and sub-device list from the Cloud API and auto-configures every sub-device. The gateway itself is never added.",
+                "data": {
+                    "host": "Gateway IP Address",
+                    "gwId": "(Optional) Gateway Device ID, if the gateway is not broadcasting"
+                }
             }
+        },
+        "error": {
+            "cloud_required": "This needs the Cloud API account: configure it first (Manage Cloud API account).",
+            "gateway_not_discovered": "No Tuya device is broadcasting from that IP. Check the IP, make sure HA and the gateway share the same L2 network, or enter the gateway Device ID manually.",
+            "gateway_not_in_cloud": "Gateway {gw_id} is not in the Cloud project device list. Check the data center and that the OEM app is linked to the project (Link My App).",
+            "no_sub_devices": "Gateway {gw_id} has no Zigbee/BLE sub-devices in the cloud device list."
+        },
+        "progress": {
+            "onboard_gateway": "Contacting the gateway and reading every sub-device. A hub with many children answers slowly, so this can take several minutes."
         }
     },
     "title": "LocalTuya"

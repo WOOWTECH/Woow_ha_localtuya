@@ -37,6 +37,9 @@ from .const import (
     CONF_NODE_ID,
     CONF_NO_CLOUD,
     CONF_PRODUCT_KEY,
+    CONF_PROTOCOL_VERSION,
+    CONF_TUYA_IP,
+    CONF_TUYA_VERSION,
     CONF_USER_ID,
     DATA_DISCOVERY,
     DOMAIN,
@@ -327,6 +330,36 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     return True
 
 
+def gateway_config_from_subdevice(sub_config: dict, discovered: dict | None) -> dict:
+    """Build the config used to open the gateway connection for a sub-device.
+
+    The LAN protocol version belongs to the gateway, not to the Zigbee/BLE
+    child: the developer platform often reports a different version for the
+    child (e.g. 3.4) than the gateway actually speaks (e.g. 3.3), and a
+    child configured that way can never complete the handshake. When the
+    gateway announced itself on UDP discovery, trust the version it broadcasts.
+    """
+    config = dict(sub_config)
+    host = config.get(CONF_HOST)
+    for dev in (discovered or {}).values():
+        if dev.get(CONF_TUYA_IP) != host:
+            continue
+        if (version := dev.get(CONF_TUYA_VERSION)) and str(version) != str(
+            config.get(CONF_PROTOCOL_VERSION)
+        ):
+            _LOGGER.info(
+                "Gateway %s broadcasts protocol %s; using it instead of the "
+                "configured %s for sub-device %s",
+                host,
+                version,
+                config.get(CONF_PROTOCOL_VERSION),
+                config.get(CONF_DEVICE_ID),
+            )
+            config[CONF_PROTOCOL_VERSION] = str(version)
+        break
+    return config
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up LocalTuya integration from a config entry."""
     if entry.version < ENTRIES_VERSION:
@@ -381,7 +414,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             # Sub-Devices
             if not (gateway := devices.get(host)):
                 # Setup sub-device as fake gateway if there is no a gateway exist.
-                devices[host] = (gateway := TuyaDevice(hass, entry, config, True))
+                discovery = hass.data[DOMAIN].get(DATA_DISCOVERY)
+                gw_config = gateway_config_from_subdevice(
+                    config, discovery.devices if discovery else None
+                )
+                devices[host] = (gateway := TuyaDevice(hass, entry, gw_config, True))
                 connect_to_devices.append(gateway)
 
             devices[f"{host}_{node_id}"] = (sub_dev := TuyaDevice(hass, entry, config))

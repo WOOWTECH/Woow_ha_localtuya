@@ -45,8 +45,30 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 RECONNECT_INTERVAL = timedelta(seconds=5)
+RECONNECT_MAX_INTERVAL = timedelta(seconds=60)
+# Seconds to wait between the immediate connect retries of one connect cycle.
+CONNECT_RETRY_DELAY = 1.5
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
 MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
+
+
+def reconnect_delay(attempts: int, absent: bool = False, low_power: bool = False):
+    """Return the seconds to wait before reconnect attempt number `attempts` + 1.
+
+    Tuya firmwares that accept a single local client need a few seconds to
+    release a dropped socket. Hammering them every 5s keeps them refusing us
+    (typically a reset right after the session-key handshake), which is what
+    users see as a gateway that "needs a power cycle". Back off exponentially,
+    capped at one minute. Low-power devices keep the short interval so their
+    short wake window isn't missed.
+    """
+    base = RECONNECT_INTERVAL.total_seconds()
+    if low_power:
+        return base
+    factor = 2 ** max(0, min(attempts - 1, 4))  # 1, 2, 4, 8, 16
+    if absent:
+        factor *= 2
+    return min(base * factor, RECONNECT_MAX_INTERVAL.total_seconds())
 
 
 class HassLocalTuyaData(NamedTuple):
@@ -192,6 +214,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         while retry < max_retries and not self.is_closing:
             retry += 1
             try:
+                if retry > 1 and not self.is_subdevice:
+                    # Give the device time to release the previous socket
+                    # before opening a new one.
+                    await asyncio.sleep(CONNECT_RETRY_DELAY * (retry - 1))
                 if self.is_subdevice:
                     gateway = self._get_gateway()
                     if not gateway:
@@ -252,6 +278,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     # Reset the interface
                     await self._interface.reset(reset_dpids, cid=self._node_id)
 
+                if self._fake_gateway and self._interface.version >= 3.4:
+                    # A gateway has no DPs of its own; asking it for the
+                    # sub-devices' online list is the handshake that matters
+                    # and it primes their ONLINE/OFFLINE state right away.
+                    try:
+                        await self._interface.subdevices_query()
+                    except Exception as ex:  # pylint: disable=broad-except
+                        self.debug(f"Sub-devices query during handshake: {ex}")
+
                 self.debug("Retrieving initial state")
                 status = await self._interface.status(cid=self._node_id)
                 if status is None:
@@ -266,7 +301,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 await self.abort_connect()
                 self._task_connect = None
             except Exception as e:
-                if not (self._fake_gateway and "Not found" in str(e)):
+                if self._fake_gateway and self.connected:
+                    # The TCP session (and session key) with the gateway is up;
+                    # the sub-device we borrowed as "gateway" just has nothing
+                    # to report right now (asleep, not yet reported since the
+                    # gateway booted, or a gateway that never answers child
+                    # DP queries). Keep the connection: every other sub-device
+                    # depends on it.
+                    self.debug(f"Gateway handshake without status: {e}", force=True)
+                else:
                     e = "Sub device is not connected" if self.is_subdevice else e
                     self.warning(f"Handshake with {host} failed due to: {e}")
                     await self.abort_connect()
@@ -460,13 +503,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     break
 
                 attempts += 1
-                scale = (
-                    2
-                    if (self.subdevice_state == SubdeviceState.ABSENT)
-                    or (attempts > MIN_OFFLINE_EVENTS)
-                    else 1
+                delay = reconnect_delay(
+                    attempts,
+                    absent=self.subdevice_state == SubdeviceState.ABSENT,
+                    low_power=self._device_config.sleep_time > 0,
                 )
-                await asyncio.sleep(scale * RECONNECT_INTERVAL.total_seconds())
+                self.debug(
+                    f"Reconnect attempt {attempts} failed, retry in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
             except asyncio.CancelledError as e:
                 self.debug(f"Reconnect task has been canceled: {e}", force=True)
                 break

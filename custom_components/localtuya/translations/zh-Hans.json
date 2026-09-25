@@ -45,7 +45,11 @@
             "entity_already_configured": "该实体已配置。",
             "address_in_use": "TCP端口6668(用于发现设备)已被占用. 请检查并确保没有其他集成正在使用该端口。",
             "discovery_failed": "发现设备时发生错误。请查看日志获取详细信息。如问题持续存在，欢迎在GitHub创建新issue一起讨论（请记得调试日志）。",
-            "empty_dps": "成功连接到设备，但未找到数据点位。请重新设置。如果问题持续存在，欢迎在GitHub创建新issue一起讨论（请记得调试日志）。"
+            "empty_dps": "成功连接到设备，但未找到数据点位。请重新设置。如果问题持续存在，欢迎在GitHub创建新issue一起讨论（请记得调试日志）。",
+            "cloud_required": "此功能需要 Cloud API 账号，请先设置（管理 Cloud API 账号）。",
+            "gateway_not_discovered": "该 IP 没有 Tuya 设备在广播。请确认 IP、HA 与网关在同一 L2 网络，或手动填写网关 Device ID。",
+            "gateway_not_in_cloud": "网关 {gw_id} 不在云端项目的设备清单中。请确认数据中心，以及 OEM App 已挂入项目（Link My App）。",
+            "no_sub_devices": "网关 {gw_id} 在云端清单中没有 Zigbee/BLE 子设备。"
         },
         "step": {
             "yaml_import": {
@@ -58,7 +62,8 @@
                 "menu_options": {
                     "add_device": "添加新设备",
                     "edit_device": "重新配置已添加设备",
-                    "configure_cloud": "管理云服务API账户"
+                    "configure_cloud": "管理云服务API账户",
+                    "add_gateway": "以 IP 上架网关及其全部子设备"
                 }
             },
             "add_device": {
@@ -116,16 +121,16 @@
                 "title": "配置设备实体",
                 "description": "LocalTuya将尝试自动发现其余配置内容。如果此方法无法适用于你的设备，或你希望自行调整设置，请选择`手动配置设备实体`选项。",
                 "menu_options": {
-                    "auto_configure_device":"自动发现设备实体",
+                    "auto_configure_device": "自动发现设备实体",
                     "pick_entity_type": "手动配置设备实体",
-                    "choose_template":"使用已保存的模板"
+                    "choose_template": "使用已保存的模板"
                 }
             },
             "auto_configure_device": {
                 "title": "自动配置",
                 "description": "发生错误：{err_msg}。如果未显示具体原因，请检查系统日志。",
                 "menu_options": {
-                    "device_setup_method":"回到配置设备实体界面"
+                    "device_setup_method": "回到配置设备实体界面"
                 }
             },
             "pick_entity_type": {
@@ -134,10 +139,10 @@
                 "data": {
                     "platform_to_add": "选择实体",
                     "no_additional_entities": "完成实体配置",
-                    "use_template" : "导入模板文件"
+                    "use_template": "导入模板文件"
                 }
             },
-            "choose_template":{
+            "choose_template": {
                 "title": "导入模板文件",
                 "description": "模板文件位于`templates`目录下（[更多信息]({templates_info_url})）。",
                 "data": {
@@ -169,7 +174,7 @@
                     "state_off": "关闭时的状态值",
                     "powergo_dp": "电源数据点位（通常为25或2）",
                     "idle_status_value": "空闲状态值（用英文逗号分隔）",
-                    "returning_status_value":  "返回状态值（用英文逗号分隔）",
+                    "returning_status_value": "返回状态值（用英文逗号分隔）",
                     "docked_status_value": "基站对接状态值（用英文逗号分隔）",
                     "fault_dp": "故障状态数据点位（通常为11）",
                     "battery_dp": "电池状态数据点位（通常为14）",
@@ -182,7 +187,7 @@
                     "clean_area_dp": "清洁面积数据点位（通常为32）",
                     "clean_record_dp": "清洁记录数据点位（通常为34）",
                     "locate_dp": "定位数据点位（通常为31）",
-                    "pause_dp":"暂停数据点位",
+                    "pause_dp": "暂停数据点位",
                     "paused_state": "暂停状态（如pause、paused等）",
                     "stop_status": "停止状态",
                     "brightness": "亮度（仅适用于白光）",
@@ -203,7 +208,7 @@
                     "fan_speed_min": "最小风速（整数）",
                     "fan_speed_max": "最大风速（整数）",
                     "fan_speed_ordered_list": "风速列表（包含最小和最大值，使用英文逗号分隔）",
-                    "fan_direction":"风向数据点位",
+                    "fan_direction": "风向数据点位",
                     "fan_direction_forward": "正向出风时风向值",
                     "fan_direction_reverse": "反向出风时风向值",
                     "fan_dps_type": "该数据点位的数据类型",
@@ -240,13 +245,13 @@
                     "min_humidity": "可支持的最低湿度",
                     "max_humidity": "可支持的最高湿度",
                     "alarm_supported_states": "设备支持的警报状态（用英文逗号分隔）",
-                    "receive_dp":"接收信号数据点位（默认为202）",
-                    "key_study_dp":"(Optional) Key Study DP (usually 7)",
-                    "lock_state_dp":"（非必填）锁定状态数据点位",
-                    "jammed_dp":"（非必填）卡顿数据点位",
-                    "target_temperature_high_dp":"（非必填）目标高温数据点位",
-                    "target_temperature_low_dp":"（非必填）目标低温数据点位",
-                    "color_mode_set":"支持的模式集合（用英文逗号分隔，如不确定请保留默认）",
+                    "receive_dp": "接收信号数据点位（默认为202）",
+                    "key_study_dp": "(Optional) Key Study DP (usually 7)",
+                    "lock_state_dp": "（非必填）锁定状态数据点位",
+                    "jammed_dp": "（非必填）卡顿数据点位",
+                    "target_temperature_high_dp": "（非必填）目标高温数据点位",
+                    "target_temperature_low_dp": "（非必填）目标低温数据点位",
+                    "color_mode_set": "支持的模式集合（用英文逗号分隔，如不确定请保留默认）",
                     "reset_timer": "（非必填）自动重置为关闭状态的定时器",
                     "swing_mode_dp": "（非必填）垂直摆风数据点位",
                     "swing_modes": "（非必填）垂直摆风选项（用英文逗号分隔）",
@@ -267,7 +272,18 @@
                     "device_class": "查看更多 [设备类型]({device_classes_url})",
                     "state_class": "查看更多 [状态分类]({state_classes_url})"
                 }
+            },
+            "add_gateway": {
+                "title": "上架网关子设备",
+                "description": "输入已在 (OEM) Tuya App 配对好的 Zigbee/BLE 网关的局域网 IP。LocalTuya 会从 UDP 广播识别网关，再通过 Cloud API 取得它的 local key 与子设备清单，并自动配置每一个子设备。网关本身不会被加入。",
+                "data": {
+                    "host": "网关 IP",
+                    "gwId": "（可选）网关 Device ID，网关没有广播时填写"
+                }
             }
+        },
+        "progress": {
+            "onboard_gateway": "正在連線網關並逐一讀取子設備。子設備多的網關回應較慢，這可能需要數分鐘。"
         }
     },
     "title": "LocalTuya"

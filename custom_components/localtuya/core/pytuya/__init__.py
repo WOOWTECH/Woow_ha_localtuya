@@ -132,6 +132,9 @@ NO_PROTOCOL_HEADER_CMDS = [
 HEARTBEAT_INTERVAL = 8.3
 TIMEOUT_CONNECT = 5
 TIMEOUT_REPLY = 5
+# A gateway relays to Zigbee/BLE children and answers far slower than a
+# Wi-Fi device: measured up to ~20s for a sleepy child on a busy hub.
+TIMEOUT_REPLY_SUBDEVICE = 25
 
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
@@ -275,14 +278,20 @@ class MessageDispatcher(ContextualLogger):
         self.version = protocol_version
         self.local_key = local_key
 
-    def abort(self):
-        """Abort all waiting clients."""
-        for feat in self.listeners.copy():
-            feature = self.listeners.pop(feat)
-            feature.cancel("aborted")
+    def abort(self, reason="aborted"):
+        """Fail every waiting client because the session is going away.
 
-    async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
-        """Wait for response to a sequence number to be received and return it."""
+        These futures are failed, not cancelled: a CancelledError raised inside
+        the keep-alive loop is indistinguishable from the loop's own task being
+        cancelled, and it would make the loop tear the connection down.
+        """
+        for seqno in list(self.listeners):
+            future = self.listeners.pop(seqno)
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_exception(TimeoutError(reason))
+
+    def register(self, seqno, cmd):
+        """Register a listener for `seqno` and return its future."""
         if seqno in self.listeners:
             self.debug(f"listener exists for {seqno}")
             if seqno == self.HEARTBEAT_SEQNO:
@@ -291,16 +300,32 @@ class MessageDispatcher(ContextualLogger):
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
         future = asyncio.Future()
         self.listeners[seqno] = future
+        return future
+
+    def discard(self, seqno):
+        """Drop a listener that will never be awaited."""
+        self.listeners.pop(seqno, None)
+
+    async def wait_future(self, future, seqno, cmd, timeout=TIMEOUT_REPLY):
+        """Await an already-registered listener."""
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            self.abort()
             raise TimeoutError(
                 f"Command {cmd} timed out waiting for sequence number {seqno}"
             )
         finally:
-            self.listeners.pop(seqno, True)
+            self.listeners.pop(seqno, None)
+
+    async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
+        """Register a listener and wait for its response.
+
+        One command timing out must NOT abort the others: on a gateway every
+        sub-device shares this dispatcher, and aborting all of them turned a
+        single slow child into a full disconnect of the whole hub.
+        """
+        future = self.register(seqno, cmd)
+        return await self.wait_future(future, seqno, cmd, timeout)
 
     def _release_listener(self, seqno, msg):
         if seqno not in self.listeners:
@@ -408,6 +433,25 @@ class MessageDispatcher(ContextualLogger):
                 )
 
 
+def split_subdev_report(reported: set, known: set, cycle: set):
+    """Decide which children a sub-device report proves to be absent.
+
+    A hub with many children answers `subdev_online_stat_query` with SEVERAL
+    replies, each listing only a slice of them (a Zemismart M1 with 55 children
+    sends ~15 per reply). Treating "not in this reply" as absent marks roughly
+    three quarters of the hub offline on every heartbeat.
+
+    So absence is only concluded once a full cycle has been seen: a reply that
+    repeats a cid already in the current cycle starts a new one, and whatever
+    was never mentioned during the finished cycle is the absent set.
+
+    Returns (absent, next_cycle).
+    """
+    if cycle & reported:  # a repeat -> the previous cycle is complete
+        return known - cycle, set(reported)
+    return set(), cycle | reported
+
+
 class TuyaListener(ABC):
     """Listener interface for Tuya device changes."""
 
@@ -428,6 +472,8 @@ class TuyaListener(ABC):
 
 class EmptyListener(TuyaListener):
     """Listener doing nothing."""
+
+    sub_devices: dict = {}
 
     def status_updated(self, status):
         """Device updated status."""
@@ -493,6 +539,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self.dispatched_dps = {}  # Store payload so we can trigger an event in HA.
         self._last_command_sent = 1  # The time last command was sent
         self._write_lock = asyncio.Lock()  # To serialize writes
+        self._request_lock = asyncio.Lock()  # To serialize seqno use
+        self._subdev_cycle: set = set()  # cids seen in the current hub report
         self.enable_debug(enable_debug)
 
     def set_version(self, protocol_version):
@@ -533,15 +581,17 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 listener = self.listener and self.listener()
                 if listener is None:
                     return
+                absent, self._subdev_cycle = split_subdev_report(
+                    set(on_devs) | set(off_devs),
+                    set(listener.sub_devices),
+                    self._subdev_cycle,
+                )
                 for cid, device in listener.sub_devices.items():
                     if cid in on_devs:
                         device.subdevice_state_updated(SubdeviceState.ONLINE)
                     elif cid in off_devs:
                         device.subdevice_state_updated(SubdeviceState.OFFLINE)
-                    else:
-                        # ABSENT detection is weak, because, with many sub-devices,
-                        # the gateway provides them all in more than 1 reply. This
-                        # should be taken into account in device.subdevice_state_updated()
+                    elif cid in absent:
                         device.subdevice_state_updated(SubdeviceState.ABSENT)
             except asyncio.CancelledError:
                 pass
@@ -618,6 +668,9 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 start = time.monotonic()
                 try:
                     await asyncio.sleep(HEARTBEAT_INTERVAL - delta)
+                    if not self.is_connected:
+                        self.debug("Session already closed, stopping heartbeat")
+                        return
                     await action()
                     fail_attempt = 0
                 except asyncio.CancelledError:
@@ -758,35 +811,49 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if not self.is_connected:
             return None
 
-        if self.version >= 3.4 and self.real_local_key == self.local_key:
-            self.debug("3.4 or 3.5 device: negotiating a new session key")
-            if not await self._negotiate_session_key():
+        # One request at a time on this connection. A Tuya device answers
+        # strictly request/response, and on a gateway dozens of sub-devices
+        # share this very socket. Running them concurrently used to let two
+        # exchanges read the same self.seqno (so one took the other's reply),
+        # and let several sub-devices renegotiate the session key at once.
+        async with self._request_lock:
+            if self.version >= 3.4 and self.real_local_key == self.local_key:
+                self.debug("3.4 or 3.5 device: negotiating a new session key")
+                if not await self._negotiate_session_key():
+                    return self.clean_up_session()
+
+            self.debug(
+                "Sending command %s (device type: %s) DPS: %s",
+                command,
+                self.dev_type,
+                dps,
+            )
+            payload = payload or self._generate_payload(command, dps, nodeId=nodeID)
+            real_cmd = payload.cmd
+            dev_type = self.dev_type
+
+            seqno = self.seqno
+
+            if payload.cmd == CMDType.HEART_BEAT:
+                seqno = MessageDispatcher.HEARTBEAT_SEQNO
+            elif payload.cmd == CMDType.UPDATEDPS:
+                seqno = MessageDispatcher.RESET_SEQNO
+            elif payload.cmd == CMDType.LAN_EXT_STREAM:
+                seqno = MessageDispatcher.SUB_DEVICE_QUERY_SEQNO
+
+            enc_payload = self._encode_message(payload)
+            future = self.dispatcher.register(seqno, payload.cmd)
+
+            try:
+                await self.transport_write(enc_payload)
+            except Exception:  # pylint: disable=broad-except
+                self.dispatcher.discard(seqno)
                 return self.clean_up_session()
 
-        self.debug(
-            "Sending command %s (device type: %s) DPS: %s", command, self.dev_type, dps
-        )
-        payload = payload or self._generate_payload(command, dps, nodeId=nodeID)
-        real_cmd = payload.cmd
-        dev_type = self.dev_type
-
-        # Wait for special sequence number
-        seqno = self.seqno
-
-        if payload.cmd == CMDType.HEART_BEAT:
-            seqno = MessageDispatcher.HEARTBEAT_SEQNO
-        elif payload.cmd == CMDType.UPDATEDPS:
-            seqno = MessageDispatcher.RESET_SEQNO
-        elif payload.cmd == CMDType.LAN_EXT_STREAM:
-            seqno = MessageDispatcher.SUB_DEVICE_QUERY_SEQNO
-
-        enc_payload = self._encode_message(payload)
-
-        try:
-            await self.transport_write(enc_payload)
-        except Exception:  # pylint: disable=broad-except
-            return self.clean_up_session()
-        msg = await self.dispatcher.wait_for(seqno, payload.cmd)
+            reply_timeout = TIMEOUT_REPLY_SUBDEVICE if nodeID else TIMEOUT_REPLY
+            msg = await self.dispatcher.wait_future(
+                future, seqno, payload.cmd, reply_timeout
+            )
         if msg is None:
             self.debug("Wait was aborted for seqno %d", seqno)
             return None
@@ -898,6 +965,14 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         # list of available dps experience shows that the dps available are usually
         # in the ranges [1-25] and [100-110] need to split the bruteforcing in
         # different steps due to request payload limitation (max. length = 255)
+
+        if cid:
+            # A gateway answers a cid query with that child's complete DP set,
+            # so the range brute force below (which exists for devices that
+            # only return the DPs they were asked for) would just repeat the
+            # same query four times per sub-device.
+            if data := await self.status(cid=cid):
+                return data
 
         ranges = [(2, 11), (11, 21), (21, 31), (100, 111)]
 
@@ -1036,7 +1111,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         except:
             # Device may instantly disconnect if we sent send wrong localkey.
             if not self.is_connected:
-                raise ConnectionAbortedError("Session key negotiation failed on step 1")
+                raise ConnectionAbortedError(
+                    "Session key negotiation failed on step 1: the device closed "
+                    "the connection. Usual causes: wrong local key, or the device "
+                    "already serves its maximum number of local clients (Smart "
+                    "Life app in LAN mode, another integration, a debug script)"
+                )
 
         if not rkey or not isinstance(rkey, TuyaMessage) or len(rkey.payload) < 48:
             # error
