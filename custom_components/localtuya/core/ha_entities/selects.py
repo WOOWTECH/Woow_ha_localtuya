@@ -1524,8 +1524,10 @@ SELECTS["wxkg"] = (
 # Zigbee scene buttons (a 3-gang scene switch behind a Zemismart M1, for one)
 # report a press as the numeric enum 0/1/2 rather than single_click /
 # double_click / long_press, so the conditioned entities above never match
-# them. These take their options from whatever range the cloud describes; a
-# DP already claimed above is skipped as a duplicate ID.
+# them. The cloud also names their DPs switch_modeN in its status API even
+# though the thing model says switchN_value, so both codes are accepted.
+# Options come from whatever range the cloud describes; a DP already claimed
+# above is skipped as a duplicate ID.
 SCENE_BUTTON_PRESSES = {
     "0": "Single click",
     "1": "Double click",
@@ -1536,10 +1538,10 @@ SCENE_BUTTON_PRESSES = {
 }
 
 
-def scene_button(number: int, code: DPCode) -> LocalTuyaEntity:
+def scene_button(number: int, codes: tuple[DPCode, ...]) -> LocalTuyaEntity:
     """A button of a wireless scene switch, showing its last press."""
     return LocalTuyaEntity(
-        id=code,
+        id=codes,
         name=f"Button {number}",
         icon="mdi:gesture-tap-button",
         custom_configs={
@@ -1557,15 +1559,15 @@ def scene_button(number: int, code: DPCode) -> LocalTuyaEntity:
 SELECTS["wxkg"] = (
     *SELECTS["wxkg"],
     *(
-        scene_button(number, code)
-        for number, code in enumerate(
+        scene_button(number, codes)
+        for number, codes in enumerate(
             (
-                DPCode.SWITCH1_VALUE,
-                DPCode.SWITCH2_VALUE,
-                DPCode.SWITCH3_VALUE,
-                DPCode.SWITCH4_VALUE,
-                DPCode.SWITCH5_VALUE,
-                DPCode.SWITCH6_VALUE,
+                (DPCode.SWITCH1_VALUE, DPCode.SWITCH_MODE1),
+                (DPCode.SWITCH2_VALUE, DPCode.SWITCH_MODE2),
+                (DPCode.SWITCH3_VALUE, DPCode.SWITCH_MODE3),
+                (DPCode.SWITCH4_VALUE, DPCode.SWITCH_MODE4),
+                (DPCode.SWITCH5_VALUE, DPCode.SWITCH_MODE5),
+                (DPCode.SWITCH6_VALUE, DPCode.SWITCH_MODE6),
             ),
             start=1,
         )

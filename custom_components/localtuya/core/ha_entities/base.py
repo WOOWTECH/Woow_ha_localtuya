@@ -698,6 +698,12 @@ class DPCode(StrEnum):
     SWITCH5_VALUE = "switch5_value"  # scene switch "wxkg"
     SWITCH6 = "switch6"  # Switch 6 no underscore
     SWITCH6_VALUE = "switch6_value"  # scene switch "wxkg"
+    SWITCH_MODE1 = "switch_mode1"  # scene switch "wxkg", status code
+    SWITCH_MODE2 = "switch_mode2"  # scene switch "wxkg", status code
+    SWITCH_MODE3 = "switch_mode3"  # scene switch "wxkg", status code
+    SWITCH_MODE4 = "switch_mode4"  # scene switch "wxkg", status code
+    SWITCH_MODE5 = "switch_mode5"  # scene switch "wxkg", status code
+    SWITCH_MODE6 = "switch_mode6"  # scene switch "wxkg", status code
     SWITCH7 = "switch7"  # Switch 7 no underscore
     SWITCH8 = "switch8"  # Switch 8 no underscore
     SWITCH_1 = "switch_1"  # Switch 1

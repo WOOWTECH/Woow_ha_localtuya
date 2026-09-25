@@ -58,6 +58,27 @@ def test_numeric_scene_buttons_get_an_entity_each():
     }
 
 
+def test_scene_buttons_named_by_the_cloud_status_api():
+    """What the M1 switches actually returned: switch_modeN status codes."""
+    device = _device(
+        [
+            "1 ( code: switch_mode1 , value: 0 )",
+            "2 ( code: switch_mode2 , value: 0, cloud pull )",
+            "3 ( code: switch_mode3 , value: 1, cloud pull )",
+        ],
+        {
+            "1": _cloud_dp("switch_mode1", NUMERIC_PRESS),
+            "2": _cloud_dp("switch_mode2", NUMERIC_PRESS),
+            "3": _cloud_dp("switch_mode3", NUMERIC_PRESS),
+        },
+    )
+
+    entities = gen_localtuya_entities(device, "wxkg")
+
+    buttons = {e["id"]: e["friendly_name"] for e in entities if e["platform"] == "select"}
+    assert buttons == {"1": "Button 1", "2": "Button 2", "3": "Button 3"}
+
+
 def test_click_named_scene_switch_keeps_its_original_entity():
     """Devices the existing template handled must not change."""
     named = {"type": "enum", "range": ["single_click", "double_click", "long_press"]}
