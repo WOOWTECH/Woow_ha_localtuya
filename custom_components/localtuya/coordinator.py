@@ -46,13 +46,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 RECONNECT_INTERVAL = timedelta(seconds=5)
 RECONNECT_MAX_INTERVAL = timedelta(seconds=60)
+RECONNECT_HUB_MAX_INTERVAL = timedelta(seconds=10)
 # Seconds to wait between the immediate connect retries of one connect cycle.
 CONNECT_RETRY_DELAY = 1.5
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
 MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
 
 
-def reconnect_delay(attempts: int, absent: bool = False, low_power: bool = False):
+def reconnect_delay(
+    attempts: int, absent: bool = False, low_power: bool = False, hub: bool = False
+):
     """Return the seconds to wait before reconnect attempt number `attempts` + 1.
 
     Tuya firmwares that accept a single local client need a few seconds to
@@ -61,6 +64,12 @@ def reconnect_delay(attempts: int, absent: bool = False, low_power: bool = False
     users see as a gateway that "needs a power cycle". Back off exponentially,
     capped at one minute. Low-power devices keep the short interval so their
     short wake window isn't missed.
+
+    A hub connection is capped much lower: every child on the hub is down
+    while it is, and a hub serves several clients, so it doesn't need the
+    time to release a socket. On a Zemismart M1 reached over Wi-Fi, the
+    one-minute cap turned each brief link drop into minutes of downtime
+    for 53 devices.
     """
     base = RECONNECT_INTERVAL.total_seconds()
     if low_power:
@@ -68,7 +77,8 @@ def reconnect_delay(attempts: int, absent: bool = False, low_power: bool = False
     factor = 2 ** max(0, min(attempts - 1, 4))  # 1, 2, 4, 8, 16
     if absent:
         factor *= 2
-    return min(base * factor, RECONNECT_MAX_INTERVAL.total_seconds())
+    cap = RECONNECT_HUB_MAX_INTERVAL if hub else RECONNECT_MAX_INTERVAL
+    return min(base * factor, cap.total_seconds())
 
 
 class HassLocalTuyaData(NamedTuple):
@@ -149,6 +159,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     def is_connecting(self):
         """Return whether device is currently connecting."""
         return self._task_connect is not None
+
+    @property
+    def holds_hub_connection(self):
+        """Return whether every child of a hub depends on this connection."""
+        return bool(self._fake_gateway or self.sub_devices)
 
     @property
     def is_subdevice(self):
@@ -254,9 +269,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     e.errno == errno.EHOSTUNREACH
                     and not self._status
                     and not self.is_sleep
+                    and not self.holds_hub_connection
                 ):
                     self.warning(f"Connection failed: {e}")
                     break
+                # A hub holder keeps retrying within this cycle: over Wi-Fi the
+                # first attempt after a drop often fails ARP and the next works.
             except Exception as ex:  # pylint: disable=broad-except
                 await self.abort_connect()
                 if not self.is_sleep:
@@ -514,6 +532,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     attempts,
                     absent=self.subdevice_state == SubdeviceState.ABSENT,
                     low_power=self._device_config.sleep_time > 0,
+                    hub=self.holds_hub_connection,
                 )
                 self.debug(
                     f"Reconnect attempt {attempts} failed, retry in {delay:.0f}s"
