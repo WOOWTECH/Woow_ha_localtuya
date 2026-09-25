@@ -54,6 +54,8 @@ from .core.helpers import (
     gateway_children,
     discovered_from_gateway,
     sleep_time_for_category,
+    manual_dps_for_category,
+    WRITE_ONLY_MARKER,
 )
 from .const import (
     ATTR_UPDATED_AT,
@@ -572,8 +574,11 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                 "\nNothing to add. Press a button on each sub-device (or power-cycle "
                 "the gateway) so they report once, then retry."
             )
+            # The confirm step returns the callback's result as the flow
+            # result, so it must be a result, not a coroutine.
             return await self.async_step_confirm(
-                msg=msg, confirm_callback=lambda: self.async_step_init()
+                msg=msg,
+                confirm_callback=lambda: self.async_create_entry(title="", data={}),
             )
         msg += "\nClick on submit to add the devices"
         return await self.async_step_confirm(
@@ -1111,6 +1116,10 @@ async def setup_localtuya_devices(
                 ),
                 CONF_PRODUCT_KEY: data.get("productKey"),
             }
+            if manual_dps := manual_dps_for_category(
+                dev_cloud_data.get(TUYA_CATEGORY, "")
+            ):
+                device_data[CONF_MANUAL_DPS] = manual_dps
             # If device is sub and has Gateway ID store gatewayID
             if sub_gwid := data.get(CONF_GATEWAY_ID):
                 device_data.update({CONF_GATEWAY_ID: sub_gwid})
@@ -1586,8 +1595,15 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                 # Reset the interface
                 await interface.reset(reset_ids, cid=cid)
 
+            write_only = cid and WRITE_ONLY_MARKER in [
+                dp.strip() for dp in data.get(CONF_MANUAL_DPS, "").split(",")
+            ]
+            if write_only:
+                # Never answers; its DPs come from the cloud further down.
+                logger.info("Write-only sub-device: skipping DP detection")
+
             # Detect any other non-manual DPS strings
-            if not detected_dps:
+            if not detected_dps and not write_only:
                 try:
                     detected_dps = await interface.detect_available_dps(cid=cid)
                 except Exception as ex:  # pylint: disable=broad-except
@@ -1596,7 +1612,7 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                     logger.info(f"First DP query failed, will retry: {ex}")
                     detected_dps = {}
 
-            if cid and not detected_dps:
+            if cid and not detected_dps and not write_only:
                 # A Zigbee/BLE child that hasn't reported since the gateway
                 # booted answers a DP query with nothing. Ask the gateway to
                 # refresh the child's DPs and read what it pushes back.

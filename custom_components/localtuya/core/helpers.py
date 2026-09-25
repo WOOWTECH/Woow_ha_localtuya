@@ -166,11 +166,23 @@ SLEEPY_CATEGORIES = {
     "znhsj",  # soil sensor
 }
 DEFAULT_SLEEP_TIME = 1800
+# Categories that only ever receive commands: they have no state to report,
+# so a status query just times out.
+WRITE_ONLY_CATEGORIES = {
+    "wnykq",  # IR blaster
+}
+# LocalTuya marks a write-only device with DP "0" in its manual DPs.
+WRITE_ONLY_MARKER = "0"
 
 
 def sleep_time_for_category(category: str) -> int:
     """Seconds of silence to tolerate from a child of this category."""
     return DEFAULT_SLEEP_TIME if category in SLEEPY_CATEGORIES else 0
+
+
+def manual_dps_for_category(category: str) -> str | None:
+    """Manual DPs to preset for a child of this category, if any."""
+    return WRITE_ONLY_MARKER if category in WRITE_ONLY_CATEGORIES else None
 
 
 def discovered_from_gateway(

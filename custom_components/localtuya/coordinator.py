@@ -287,12 +287,19 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     except Exception as ex:  # pylint: disable=broad-except
                         self.debug(f"Sub-devices query during handshake: {ex}")
 
-                self.debug("Retrieving initial state")
-                status = await self._interface.status(cid=self._node_id)
-                if status is None:
-                    raise Exception("Failed to retrieve status")
+                if self.is_write_only:
+                    # An IR blaster or BLE light never answers a status query.
+                    # Asking anyway holds the gateway's shared request slot
+                    # for the full reply timeout on every (re)connect, which
+                    # stalls every other child on the hub in the meantime.
+                    self.debug("Write-only sub-device: skipping status query")
+                else:
+                    self.debug("Retrieving initial state")
+                    status = await self._interface.status(cid=self._node_id)
+                    if status is None:
+                        raise Exception("Failed to retrieve status")
 
-                self.status_updated(status)
+                    self.status_updated(status)
             except (UnicodeDecodeError, DecodeError) as e:
                 self.exception(f"Handshake with {host} failed: due to {type(e)}: {e}")
                 await self.abort_connect()
