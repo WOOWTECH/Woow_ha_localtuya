@@ -291,11 +291,17 @@ class MessageDispatcher(ContextualLogger):
                 future.set_exception(TimeoutError(reason))
 
     def register(self, seqno, cmd):
-        """Register a listener for `seqno` and return its future."""
-        if seqno in self.listeners:
+        """Register a listener for `seqno` and return its future.
+
+        Replies are awaited outside the request lock, so two requests on a
+        fixed key (heartbeat, sub-device query, reset) can overlap; the second
+        shares the pending future rather than orphaning the first.
+        """
+        existing = self.listeners.get(seqno)
+        if existing is not None and not existing.done():
+            if seqno < 0:
+                return existing
             self.debug(f"listener exists for {seqno}")
-            if seqno == self.HEARTBEAT_SEQNO:
-                raise Exception(f"listener exists for {seqno}")
 
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
         future = asyncio.Future()
@@ -309,13 +315,16 @@ class MessageDispatcher(ContextualLogger):
     async def wait_future(self, future, seqno, cmd, timeout=TIMEOUT_REPLY):
         """Await an already-registered listener."""
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            # Shielded: one waiter timing out must not cancel a future that
+            # another waiter shares.
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"Command {cmd} timed out waiting for sequence number {seqno}"
             )
         finally:
-            self.listeners.pop(seqno, None)
+            if self.listeners.get(seqno) is future:
+                self.listeners.pop(seqno, None)
 
     async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
         """Register a listener and wait for its response.
@@ -811,11 +820,15 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if not self.is_connected:
             return None
 
-        # One request at a time on this connection. A Tuya device answers
-        # strictly request/response, and on a gateway dozens of sub-devices
-        # share this very socket. Running them concurrently used to let two
-        # exchanges read the same self.seqno (so one took the other's reply),
-        # and let several sub-devices renegotiate the session key at once.
+        # Sending is one request at a time: reading self.seqno, encoding
+        # (which increments it), registering the listener and writing must be
+        # atomic, or two exchanges end up waiting on the same sequence number,
+        # and only one sub-device may renegotiate the session key. Waiting for
+        # the reply is NOT under the lock: a sleeping Zigbee child takes ~20s
+        # to answer, and holding the lock that long starved the heartbeat
+        # until the hub closed the session (every one to two minutes on a
+        # Zemismart M1 with seven battery children). Replies are matched by
+        # sequence number, so they can be awaited concurrently.
         async with self._request_lock:
             if self.version >= 3.4 and self.real_local_key == self.local_key:
                 self.debug("3.4 or 3.5 device: negotiating a new session key")
@@ -850,10 +863,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 self.dispatcher.discard(seqno)
                 return self.clean_up_session()
 
-            reply_timeout = TIMEOUT_REPLY_SUBDEVICE if nodeID else TIMEOUT_REPLY
-            msg = await self.dispatcher.wait_future(
-                future, seqno, payload.cmd, reply_timeout
-            )
+        reply_timeout = TIMEOUT_REPLY_SUBDEVICE if nodeID else TIMEOUT_REPLY
+        msg = await self.dispatcher.wait_future(
+            future, seqno, payload.cmd, reply_timeout
+        )
         if msg is None:
             self.debug("Wait was aborted for seqno %d", seqno)
             return None
