@@ -33,7 +33,9 @@ from .coordinator import TuyaDevice, HassLocalTuyaData, TuyaCloudApi
 from .config_flow import ENTRIES_VERSION
 from .const import (
     ATTR_UPDATED_AT,
+    CONF_DEVICE_SLEEP_TIME,
     CONF_GATEWAY_ID,
+    CONF_MANUAL_DPS,
     CONF_NODE_ID,
     CONF_NO_CLOUD,
     CONF_PRODUCT_KEY,
@@ -46,6 +48,7 @@ from .const import (
     PLATFORMS,
 )
 
+from .core.helpers import WRITE_ONLY_MARKER
 from .discovery import TuyaDiscovery
 
 _LOGGER = logging.getLogger(__name__)
@@ -330,6 +333,26 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     return True
 
 
+def device_setup_order(item: tuple[str, dict]) -> tuple[int, int]:
+    """Sort key: parents first, then the sub-devices best suited to hold the
+    shared gateway connection.
+
+    The first sub-device of a host lends its config to the connection every
+    other child on that hub uses. A battery child that sleeps, or a
+    write-only one (IR blaster) that never answers, makes a poor holder:
+    with a sleeping sensor holding it, the hub connection dropped every one
+    to two minutes. Prefer mains-powered children that answer queries.
+    """
+    config = item[1]
+    if not config.get(CONF_NODE_ID):
+        return (0, 0)
+    manual = [dp.strip() for dp in str(config.get(CONF_MANUAL_DPS) or "").split(",")]
+    poor_holder = (config.get(CONF_DEVICE_SLEEP_TIME) or 0) > 0 or (
+        WRITE_ONLY_MARKER in manual
+    )
+    return (1, 1 if poor_holder else 0)
+
+
 def gateway_config_from_subdevice(sub_config: dict, discovered: dict | None) -> dict:
     """Build the config used to open the gateway connection for a sub-device.
 
@@ -340,6 +363,13 @@ def gateway_config_from_subdevice(sub_config: dict, discovered: dict | None) -> 
     gateway announced itself on UDP discovery, trust the version it broadcasts.
     """
     config = dict(sub_config)
+    # The gateway connection must not inherit the donor child's quirks: a
+    # battery child's sleep time made the whole hub connection behave like a
+    # sleeping device, and it dropped every minute or two.
+    config[CONF_DEVICE_SLEEP_TIME] = 0
+    if manual := config.get(CONF_MANUAL_DPS):
+        kept = [dp for dp in manual.split(",") if dp.strip() != WRITE_ONLY_MARKER]
+        config[CONF_MANUAL_DPS] = ",".join(kept)
     host = config.get(CONF_HOST)
     for dev in (discovered or {}).values():
         if dev.get(CONF_TUYA_IP) != host:
@@ -392,12 +422,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         devices = hass_localtuya.devices
         connect_to_devices: list[TuyaDevice] = []
 
-        # Sort parent devices first then sub-devices.
-        sorted_devices = dict(
-            sorted(
-                entry_devices.items(), key=lambda k: 1 if k[1].get(CONF_NODE_ID) else 0
-            )
-        )
+        # Parents first, then the sub-devices best suited to hold the gateway
+        # connection (see device_setup_order).
+        sorted_devices = dict(sorted(entry_devices.items(), key=device_setup_order))
 
         for dev_id, config in sorted_devices.items():
             if check_if_device_disabled(hass, entry, dev_id):
