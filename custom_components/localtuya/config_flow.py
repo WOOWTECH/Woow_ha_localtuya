@@ -487,7 +487,29 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         )
 
     async def _async_onboard_gateway(self, host: str, gw_id: str, found: dict | None):
-        """Background half of add_gateway; stores its outcome for the next step."""
+        """Background half of add_gateway; always stores an outcome.
+
+        Without this, a task that died or was cancelled left no result, and
+        the flow reported an empty "unknown" error with nothing in the log.
+        """
+        try:
+            await self._async_onboard_gateway_steps(host, gw_id, found)
+        except asyncio.CancelledError:
+            _LOGGER.warning("Gateway %s: onboarding was cancelled", host)
+            self._gateway_result = {
+                "error": "unknown",
+                "gw_id": gw_id,
+                "ex": "cancelled",
+            }
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            _LOGGER.exception("Gateway %s: onboarding failed", host)
+            self._gateway_result = {"error": "unknown", "gw_id": gw_id, "ex": repr(ex)}
+
+    async def _async_onboard_gateway_steps(
+        self, host: str, gw_id: str, found: dict | None
+    ):
+        """Enumerate the gateway's children and validate each of them."""
         version = str(found.get(CONF_TUYA_VERSION, "auto")) if found else "auto"
         product_key = found.get("productKey") if found else None
 
@@ -550,7 +572,10 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                 step_id="add_gateway",
                 data_schema=ADD_GATEWAY_SCHEMA,
                 errors=errors,
-                description_placeholders={"gw_id": (result or {}).get("gw_id", "")},
+                description_placeholders={
+                    "gw_id": (result or {}).get("gw_id", ""),
+                    "ex": (result or {}).get("ex", ""),
+                },
             )
 
         devices, fails = result["devices"], result["fails"]
@@ -1157,6 +1182,7 @@ async def setup_localtuya_devices(
     for dev_id, dev_data in copy.deepcopy(devices).items():
         category = devices_cloud_data[dev_id].get("category")
         dev_data[DEVICE_CLOUD_DATA] = devices_cloud_data[dev_id]
+        dev_entites = None  # must not carry over from the previous device
         if category and (dps_strings := dev_data.get(CONF_DPS_STRINGS, False)):
             dev_entites = gen_localtuya_entities(dev_data, category)
 
@@ -1487,6 +1513,17 @@ class GatewaySession:
             self._interface = None
 
 
+LIVE_GATEWAY_WAIT = 90
+
+
+async def wait_for_live_connection(device, timeout: float) -> bool:
+    """Wait until a running gateway connection is up again; True if it is."""
+    deadline = time.monotonic() + timeout
+    while not device.connected and time.monotonic() < deadline:
+        await asyncio.sleep(1)
+    return bool(device.connected)
+
+
 async def nudge_subdevice_dps(interface, cid: str, logger, wait: float = 2.0) -> dict:
     """Ask the gateway to refresh a child's DPs, then return what it reported."""
     logger.info("No DPs from sub-device %s, requesting a refresh via the gateway", cid)
@@ -1526,10 +1563,16 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
     try:
         conf_protocol = data[CONF_PROTOCOL_VERSION]
         auto_protocol = conf_protocol == "auto"
+        existed_interface = localtuya_devices.get(data[CONF_HOST]) if cid else None
+        if existed_interface is not None and not existed_interface.connected:
+            # The running integration owns this hub's connection and is
+            # reconnecting. A second connection competes with it: Tuya hubs
+            # accept one to three LAN clients and drop the rest, which can
+            # take the live connection down with it.
+            await wait_for_live_connection(existed_interface, LIVE_GATEWAY_WAIT)
         # If sub device we will search if gateway is existed if not create new connection.
         if (
-            cid
-            and (existed_interface := localtuya_devices.get(data[CONF_HOST]))
+            existed_interface is not None
             and existed_interface.connected
             and not existed_interface.is_connecting
         ):
