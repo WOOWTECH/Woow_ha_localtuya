@@ -138,6 +138,10 @@ TIMEOUT_REPLY_SUBDEVICE = 25
 # How many unanswered sub-device queries mark a gateway as not supporting it.
 SUBDEV_QUERY_PROBES = 2
 
+QUERY_CMDS = (CMDType.DP_QUERY, CMDType.DP_QUERY_NEW)
+# Frames that can carry a sub-device's state (and its cid).
+STATE_CMDS = (CMDType.STATUS, CMDType.DP_QUERY, CMDType.DP_QUERY_NEW)
+
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
 
@@ -276,9 +280,15 @@ class MessageDispatcher(ContextualLogger):
         super().__init__()
         self.buffer = b""
         self.listeners: dict[str, asyncio.Future] = {}
+        # seqno -> cid of the sub-device each pending status query is about.
+        self.query_cids: dict[int, str] = {}
         self.callback_status_update = callback_status_update
         self.version = protocol_version
         self.local_key = local_key
+        # Set by the protocol: the cid a message is about (None if it names
+        # none), and a hook that sees every incoming sequence number.
+        self.peek_cid = None
+        self.sync_seqno = None
 
     def abort(self, reason="aborted"):
         """Fail every waiting client because the session is going away.
@@ -287,17 +297,21 @@ class MessageDispatcher(ContextualLogger):
         the keep-alive loop is indistinguishable from the loop's own task being
         cancelled, and it would make the loop tear the connection down.
         """
+        self.query_cids.clear()
         for seqno in list(self.listeners):
             future = self.listeners.pop(seqno)
             if isinstance(future, asyncio.Future) and not future.done():
                 future.set_exception(TimeoutError(reason))
 
-    def register(self, seqno, cmd):
+    def register(self, seqno, cmd, cid=None):
         """Register a listener for `seqno` and return its future.
 
         Replies are awaited outside the request lock, so two requests on a
         fixed key (heartbeat, sub-device query, reset) can overlap; the second
         shares the pending future rather than orphaning the first.
+
+        `cid` marks a status query for that sub-device: its reply is matched
+        by cid rather than by sequence number (see `_dispatch`).
         """
         existing = self.listeners.get(seqno)
         if existing is not None and not existing.done():
@@ -308,11 +322,16 @@ class MessageDispatcher(ContextualLogger):
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
         future = asyncio.Future()
         self.listeners[seqno] = future
+        if cid:
+            self.query_cids[seqno] = cid
+        else:
+            self.query_cids.pop(seqno, None)
         return future
 
     def discard(self, seqno):
         """Drop a listener that will never be awaited."""
         self.listeners.pop(seqno, None)
+        self.query_cids.pop(seqno, None)
 
     async def wait_future(self, future, seqno, cmd, timeout=TIMEOUT_REPLY):
         """Await an already-registered listener."""
@@ -326,7 +345,7 @@ class MessageDispatcher(ContextualLogger):
             )
         finally:
             if self.listeners.get(seqno) is future:
-                self.listeners.pop(seqno, None)
+                self.discard(seqno)
 
     async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
         """Register a listener and wait for its response.
@@ -347,6 +366,36 @@ class MessageDispatcher(ContextualLogger):
             future.set_result(msg)
         else:
             self.debug(f"{seqno} - Got additional message without request: skip {msg}")
+
+    def _cid_of(self, msg: TuyaMessage):
+        """The sub-device a state frame is about, if the protocol can tell."""
+        if self.peek_cid is None or not msg.payload or msg.cmd not in STATE_CMDS:
+            return None
+        return self.peek_cid(msg)
+
+    def _answer_queries(self, cid, msg: TuyaMessage) -> bool:
+        """Release every pending status query about `cid` with `msg`."""
+        waiting = [
+            seqno for seqno, query_cid in self.query_cids.items() if query_cid == cid
+        ]
+        for seqno in waiting:
+            self.query_cids.pop(seqno)
+            future = self.listeners.pop(seqno, None)
+            if future is not None and not future.done():
+                future.set_result(msg)
+        return bool(waiting)
+
+    def _accepts(self, seqno, msg: TuyaMessage, cid) -> bool:
+        """Whether `msg`, found at `seqno`, may be taken as that request's reply."""
+        # Sub-device online reports are pushed unsolicited; the query that
+        # asks for them waits on SUB_DEVICE_QUERY_SEQNO, not on a number.
+        if msg.cmd == CMDType.LAN_EXT_STREAM:
+            return False
+        if seqno in self.query_cids:
+            # A reply naming its sub-device was matched by cid already. One
+            # naming none ("data unvalid", an error) can only be matched here.
+            return cid is None and bool(msg.payload) and msg.cmd in STATE_CMDS
+        return True
 
     def add_data(self, data: bytes):
         """Add new data to the buffer and try to parse messages."""
@@ -404,7 +453,29 @@ class MessageDispatcher(ContextualLogger):
 
         self.debug("Dispatching message CMD %r %s", msg.cmd, msg)
 
-        if msg.seqno in self.listeners:
+        if msg.seqno > 0 and self.sync_seqno is not None:
+            self.sync_seqno(msg.seqno)
+
+        # A hub such as the Zemismart M1 numbers every frame it sends from one
+        # counter and does not echo the request's number, so a request can only
+        # predict the number of its reply. Any frame pushed in between (the
+        # sub-device online report arrives in several chunks right after the
+        # handshake) takes that number and shifts every later reply by one:
+        # at HA startup a child got a report chunk or its neighbour's reply as
+        # its status, and stayed unavailable. A reply naming a sub-device is
+        # therefore given to the query about that sub-device, whatever its
+        # sequence number.
+        cid = self._cid_of(msg)
+        if cid is not None:
+            answered = self._answer_queries(cid, msg)
+            if msg.cmd != CMDType.STATUS:
+                if not answered:
+                    # No one is waiting (any more), but the reply still carries
+                    # this sub-device's state.
+                    self.callback_status_update(msg)
+                return
+
+        if msg.seqno in self.listeners and self._accepts(msg.seqno, msg, cid):
             self.debug("Dispatching sequence number %d", msg.seqno)
             self._release_listener(msg.seqno, msg)
 
@@ -618,14 +689,11 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
     def _setup_dispatcher(self) -> MessageDispatcher:
         def _status_update(msg, ack=False):
-            if msg.seqno > 0:
-                if msg.seqno >= self.seqno:
-                    self.seqno = msg.seqno + 1
-                if ack:
-                    self.debug(
-                        f"Got update ack message update seqno only. msg.seqno={msg.seqno} self.seqno={self.seqno}"
-                    )
-                    return
+            if msg.seqno > 0 and ack:
+                self.debug(
+                    f"Got update ack message update seqno only. msg.seqno={msg.seqno} self.seqno={self.seqno}"
+                )
+                return
 
             decoded_message: dict = self._decode_payload(msg.payload)
             cid = None
@@ -659,7 +727,24 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
                 listener.status_updated(status)
 
-        return MessageDispatcher(self.id, _status_update, self.version, self.local_key)
+        def _sync_seqno(seqno):
+            # Hubs that number their own frames answer under the number that
+            # follows the last one they sent: predict it for the next request.
+            if seqno >= self.seqno:
+                self.seqno = seqno + 1
+
+        def _peek_cid(msg):
+            if not self._serves_subdevices:
+                return None
+            decoded = self._decode_payload(msg.payload)
+            return decoded.get("cid") if isinstance(decoded, dict) else None
+
+        dispatcher = MessageDispatcher(
+            self.id, _status_update, self.version, self.local_key
+        )
+        dispatcher.sync_seqno = _sync_seqno
+        dispatcher.peek_cid = _peek_cid
+        return dispatcher
 
     def connection_made(self, transport):
         """Did connect to the device."""
@@ -891,7 +976,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 seqno = MessageDispatcher.SUB_DEVICE_QUERY_SEQNO
 
             enc_payload = self._encode_message(payload)
-            future = self.dispatcher.register(seqno, payload.cmd)
+            query_cid = nodeID if command in QUERY_CMDS else None
+            future = self.dispatcher.register(seqno, payload.cmd, cid=query_cid)
 
             try:
                 await self.transport_write(enc_payload)
@@ -935,10 +1021,11 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
         self.dps_cache.setdefault("parent", {})
         if status and "dps" in status:
-            if "cid" in status:
-                self.dps_cache.update({status["cid"]: status["dps"]})
-            else:
-                self.dps_cache["parent"].update(status["dps"])
+            # Merged, not replaced: a query can be answered by a pushed report
+            # that carries only the data points that changed.
+            self.dps_cache.setdefault(status.get("cid", "parent"), {}).update(
+                status["dps"]
+            )
 
         return self.dps_cache.get(cid or "parent", {})
 

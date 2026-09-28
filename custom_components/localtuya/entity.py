@@ -186,6 +186,11 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                     self.status_updated()
 
                 self.schedule_update_ha_state()
+            elif self._availability_is_stale():
+                # Written as unavailable before the device connected, and the
+                # status it connected with ({} for a child that had not
+                # answered yet) was no change: it stayed unavailable for good.
+                self.schedule_update_ha_state()
 
         signal = f"localtuya_{self._device_config.id}"
 
@@ -250,6 +255,14 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     def available(self) -> bool:
         """Return if device is available or not."""
         return (len(self._status) > 0) or self._device.connected
+
+    def _availability_is_stale(self) -> bool:
+        """Whether the state written in HA disagrees with `available`."""
+        if self.hass is None or self.entity_id is None:
+            return False
+        if (state := self.hass.states.get(self.entity_id)) is None:
+            return False
+        return (state.state == STATE_UNAVAILABLE) == self.available
 
     @property
     def entity_category(self) -> str:
