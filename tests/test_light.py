@@ -82,3 +82,33 @@ async def test_light():
 
     # Bluetooth
     # device.status_updated({"21": "colour", "24": "AHhkZA==", "25": ""})
+
+
+async def test_light_white_request_drops_colour_dp():
+    """A colour-temp/brightness request must not carry colour data: some bulbs
+    stay in colour mode when one command carries both (hass-localtuya #846)."""
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaLight)
+    entity_1, *_ = get_entites(device)
+    device.status_updated({**DPS_STATUS, "21": "colour", "24": ENC_COLOR})
+
+    device.set_dps = AsyncMock()
+    await entity_1.async_turn_on(brightness=200, color_temp_kelvin=4000)
+
+    payload = device.set_dps.call_args.args[0]
+    assert payload["21"] == "white"
+    assert "22" in payload and "23" in payload
+    assert "24" not in payload
+
+
+async def test_light_colour_request_drops_colour_temp_dp():
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaLight)
+    entity_1, *_ = get_entites(device)
+    device.status_updated(DPS_STATUS.copy())
+
+    device.set_dps = AsyncMock()
+    await entity_1.async_turn_on(hs_color=(120, 100), brightness=128)
+
+    payload = device.set_dps.call_args.args[0]
+    assert payload["21"] == "colour"
+    assert "24" in payload
+    assert "23" not in payload
