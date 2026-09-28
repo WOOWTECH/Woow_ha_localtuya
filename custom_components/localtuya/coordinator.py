@@ -118,6 +118,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._fake_gateway = fake_gateway
         self._node_id: str = self._device_config.node_id
         self._subdevice_off_count: int = 0
+        # What the gateway behind this connection supports; kept across reconnects.
+        self._hub_caps: dict = {}
 
         # last_update_time: Sleep timer, a device that reports the status every x seconds then goes into sleep.
         self._last_update_time = time.monotonic() - 5
@@ -296,14 +298,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     # Reset the interface
                     await self._interface.reset(reset_dpids, cid=self._node_id)
 
-                if self._fake_gateway and self._interface.version >= 3.4:
-                    # A gateway has no DPs of its own; asking it for the
-                    # sub-devices' online list is the handshake that matters
-                    # and it primes their ONLINE/OFFLINE state right away.
+                if self._fake_gateway:
+                    # A gateway has no DPs of its own. Its first beat is the
+                    # handshake that matters (3.4+ negotiates the session key
+                    # here); where the hub answers the sub-device query, it also
+                    # primes every sub-device's ONLINE/OFFLINE state right away.
                     try:
-                        await self._interface.subdevices_query()
+                        await self._interface.gateway_beat(self._hub_caps)
                     except Exception as ex:  # pylint: disable=broad-except
-                        self.debug(f"Sub-devices query during handshake: {ex}")
+                        self.debug(f"Gateway handshake beat: {ex}")
 
                 if self.is_write_only:
                     # An IR blaster or BLE light never answers a status query.
@@ -388,7 +391,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             if self.sub_devices:
                 asyncio.create_task(self._connect_subdevices())
 
-            self._interface.keep_alive(len(self.sub_devices) > 0)
+            self._interface.keep_alive(len(self.sub_devices) > 0, self._hub_caps)
 
         # If not connected try to handle the errors.
         if not self.connected and not self.is_closing:

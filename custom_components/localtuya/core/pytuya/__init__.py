@@ -135,6 +135,8 @@ TIMEOUT_REPLY = 5
 # A gateway relays to Zigbee/BLE children and answers far slower than a
 # Wi-Fi device: measured up to ~20s for a sleepy child on a busy hub.
 TIMEOUT_REPLY_SUBDEVICE = 25
+# How many unanswered sub-device queries mark a gateway as not supporting it.
+SUBDEV_QUERY_PROBES = 2
 
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
@@ -550,6 +552,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self._write_lock = asyncio.Lock()  # To serialize writes
         self._request_lock = asyncio.Lock()  # To serialize seqno use
         self._subdev_cycle: set = set()  # cids seen in the current hub report
+        self._serves_subdevices = False  # set once a request carries a cid
         self.enable_debug(enable_debug)
 
     def set_version(self, protocol_version):
@@ -662,11 +665,45 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         """Did connect to the device."""
         self.transport = transport
 
-    def keep_alive(self, is_gateway: bool = False):
+    async def gateway_beat(self, caps: dict):
+        """One keep-alive beat for a gateway connection.
+
+        The sub-device online list is the preferred beat: it also tells which
+        sub-devices went offline. Not every gateway answers it (Tuya 3.3 hubs
+        and some 3.5 ones don't; a LIDL 3.3 hub simply ignores it), and a beat
+        that is never answered used to drop the connection every ~20s. So the
+        query is probed: after SUBDEV_QUERY_PROBES unanswered attempts the
+        gateway is marked as not supporting it and gets a plain heartbeat.
+        `caps` outlives this connection, so the probe isn't repeated on every
+        reconnect.
+        """
+        if caps.get("subdev_query") is False:
+            return await self.heartbeat()
+        try:
+            await self.subdevices_query()
+        except TimeoutError:
+            if caps.get("subdev_query"):
+                raise  # it used to answer: this is a real miss
+            misses = caps.get("subdev_query_misses", 0) + 1
+            caps["subdev_query_misses"] = misses
+            if misses >= SUBDEV_QUERY_PROBES:
+                caps["subdev_query"] = False
+                self.info(
+                    "Gateway does not answer the sub-device query; using a plain "
+                    "heartbeat. Sub-devices that go offline cannot be detected on "
+                    "this gateway."
+                )
+            # Keep the session alive this beat all the same.
+            return await self.heartbeat()
+        caps["subdev_query"] = True
+
+    def keep_alive(self, is_gateway: bool = False, caps: dict | None = None):
         """
         Start the heartbeat transmissions with the device.
-            is_gateway: will use subdevices_query as heartbeat.
+            is_gateway: beat with the sub-device query where the gateway answers it.
+            caps: gateway capabilities that outlive this connection.
         """
+        caps = caps if caps is not None else {}
 
         async def keep_alive_loop(action):
             """Continuously send heart beat updates."""
@@ -707,10 +744,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             # Prevent duplicates heartbeat task
             self.heartbeater = self.loop.create_task(
                 keep_alive_loop(
-                    # Ver. 3.3 gateways don't respond to subdevice query
-                    self.subdevices_query
-                    if is_gateway and self.version >= 3.4
-                    else self.heartbeat
+                    (lambda: self.gateway_beat(caps)) if is_gateway else self.heartbeat
                 )
             )
 
@@ -829,6 +863,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         # until the hub closed the session (every one to two minutes on a
         # Zemismart M1 with seven battery children). Replies are matched by
         # sequence number, so they can be awaited concurrently.
+        if nodeID:
+            self._serves_subdevices = True
         async with self._request_lock:
             if self.version >= 3.4 and self.real_local_key == self.local_key:
                 self.debug("3.4 or 3.5 device: negotiating a new session key")
@@ -1068,7 +1104,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                     return self.error_json(ERR_JSON, payload)
 
             if "data unvalid" in payload:  # codespell:ignore
-                if self.version == 3.3:
+                # On a gateway the reply concerns one sub-device, and some hubs
+                # answer this way when polled without a cid. Switching the whole
+                # shared connection to type_0d would change how every other
+                # sub-device is queried (tinytuya disables the detection for
+                # gateways for the same reason).
+                if self.version == 3.3 and not self._serves_subdevices:
                     self.dev_type = "type_0d"
                     self.debug(
                         "'data unvalid' error detected: switching to dev_type %r",

@@ -1423,6 +1423,35 @@ def flow_schema(platform, dps_strings):
 
 GATEWAY_CONNECT_ATTEMPTS = 4
 GATEWAY_CONNECT_RETRY_DELAY = 1.5
+# Tuya Zigbee/BLE gateways speak 3.3 or later. Newest first: 3.5 and 3.4 are
+# confirmed by a session-key handshake, which only the right version and key
+# complete; 3.3 has no handshake, so it is only tried once those have failed.
+GATEWAY_PROBE_VERSIONS = ("3.5", "3.4", "3.3")
+
+
+async def verify_gateway_protocol(iface, version: str) -> bool:
+    """Return whether an open connection really speaks `version`.
+
+    A TCP connect succeeds whatever the version, so it proves nothing. On 3.4+
+    the first exchange negotiates a session key; the reply to the query itself
+    is optional (some hubs ignore it), the negotiated key is the proof. On 3.3
+    a heartbeat ACK proves the gateway parsed a 3.3 frame: 3.4 and 3.5 hubs
+    discard those.
+    """
+    try:
+        if float(version) >= 3.4:
+            await iface.subdevices_query()
+        else:
+            await iface.heartbeat()
+    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.debug("Protocol %s probe: %s", version, ex)
+        if float(version) < 3.4:
+            return False
+    if not iface.is_connected:
+        return False
+    if float(version) >= 3.4:
+        return iface.local_key != iface.real_local_key
+    return True
 
 
 class GatewaySession:
@@ -1458,7 +1487,7 @@ class GatewaySession:
         """
         if self._runtime.devices.get(self.host):
             return self  # a real TuyaDevice already holds the connection
-        versions = [version] if version != "auto" else list(SUPPORTED_PROTOCOL_VERSIONS)
+        versions = [version] if version != "auto" else list(GATEWAY_PROBE_VERSIONS)
         for attempt in range(1, GATEWAY_CONNECT_ATTEMPTS + 1):
             for ver in versions:
                 try:
@@ -1475,20 +1504,11 @@ class GatewaySession:
                         ex,
                     )
                     continue
-                # The session-key handshake happens on the first exchange. Use
-                # the sub-device online list for it on 3.4+; the reply itself
-                # is optional (some hubs ignore the query but still serve cid
-                # status requests), so only a dead socket rules a version out.
-                try:
-                    if float(ver) >= 3.4:
-                        await iface.subdevices_query()
-                except Exception as ex:  # pylint: disable=broad-except
-                    _LOGGER.debug(
-                        "Gateway %s: sub-device query on %s: %s", self.host, ver, ex
-                    )
-                if not iface.is_connected:
+                if not await verify_gateway_protocol(iface, ver):
                     await iface.close()
-                    _LOGGER.info("Gateway %s: handshake on %s refused", self.host, ver)
+                    _LOGGER.info(
+                        "Gateway %s: does not speak protocol %s", self.host, ver
+                    )
                     continue
                 _LOGGER.info(
                     "Gateway %s: shared session on protocol %s", self.host, ver
