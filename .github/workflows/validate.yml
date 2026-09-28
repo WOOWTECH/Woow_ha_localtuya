@@ -21,4 +21,7 @@ jobs:
           category: "integration"
 
       - name: "Hassfest validation"
+        # Run it even when the HACS check fails (e.g. while the repository is
+        # private, which HACS does not support).
+        if: ${{ !cancelled() }}
         uses: home-assistant/actions/hassfest@master
