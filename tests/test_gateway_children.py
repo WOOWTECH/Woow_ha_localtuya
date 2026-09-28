@@ -153,3 +153,34 @@ async def test_write_only_child_is_never_queried():
 
     iface.status.assert_not_awaited()
     assert child.connected
+
+
+async def test_write_only_child_comes_back_after_a_reconnect():
+    """Its entities used to stay unavailable forever after a disconnect: the
+    restored state was only dispatched on the very first connect."""
+    dump = await init(SWITCH_CONFIG, SWITCH, LocalTuyaSwitch)
+    child_config = {
+        **DEVICE_CONFIG,
+        "device_id": "bf000000000000000irbl2",
+        "node_id": "0000000000000c02",
+        "manual_dps_strings": WRITE_ONLY_MARKER,
+        "entities": [],
+    }
+    gateway = coordinator.TuyaDevice(dump.hass, dump._entry, child_config, True)
+    child = coordinator.TuyaDevice(dump.hass, dump._entry, child_config)
+    child.gateway = gateway
+    child._status = {"0": "restore"}  # restored on an earlier connect
+    child._dispatch_status = Mock()
+
+    iface = Mock()
+    iface.is_connected = True
+    iface.version = 3.5
+    iface.add_dps_to_request = Mock()
+    iface.enable_debug = Mock()
+    iface.keep_alive = Mock()
+    gateway._interface = iface
+
+    await child._make_connection()
+
+    assert child.connected
+    child._dispatch_status.assert_called()

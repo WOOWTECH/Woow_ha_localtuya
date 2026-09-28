@@ -382,8 +382,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             if self.is_subdevice:
                 self.subdevice_state_updated(SubdeviceState.ONLINE)
 
-            if not self._status and "0" in self._device_config.manual_dps.split(","):
-                self.status_updated(RESTORE_STATES)
+            if "0" in self._device_config.manual_dps.split(","):
+                # A write-only device never reports, so nothing else marks its
+                # entities available again after a disconnect set them
+                # unavailable: dispatch the state it had (restored on the
+                # first connect).
+                if not self._status:
+                    self.status_updated(RESTORE_STATES)
+                else:
+                    self._dispatch_status()
 
             if self._pending_status:
                 await self.set_status()
