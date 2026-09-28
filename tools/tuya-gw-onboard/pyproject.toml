@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tuya-gw-onboard"
+version = "0.1.0"
+description = "Given the LAN IP of a Tuya Zigbee/BLE gateway paired in a (OEM) Tuya app, discover it, pull its local key and sub-devices from the Tuya Cloud, verify local control of each child, and emit a LocalTuya-ready plan."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["tinytuya>=1.16"]
+
+[project.scripts]
+tuya-gw-onboard = "tuya_gw_onboard.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tuya_gw_onboard"]

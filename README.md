@@ -1,60 +1,151 @@
-<a  href="https://www.buymeacoffee.com/mrbanderx3"  target="_blank"><img  src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png"  alt="Buy Me A Coffee"  style="height: 30px !important;width: 150px !important;box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;-webkit-box-shadow: 0px 3px 2px 0px rgba(190, 190, 190, 0.5) !important;" ></a>
+# Woow_ha_localtuya：WoowTech 特製版 LocalTuya
+
+在 Home Assistant 裡**不經雲端**直接控制 Tuya 設備的自訂整合，特別強化了**透過 Tuya Zigbee／藍牙網關控制子設備**的情境：一台網關帶幾十台燈、開關、感應器時，連線穩定、斷線能快速恢復，並且可以**只輸入網關 IP，就把整台網關底下的子設備一次上架**。
+
+- 整合名稱：Local Tuya（domain：`localtuya`）
+- 版本：`2026.7.0+woow.1`（基於上游 2026.07.0）
+- 授權：GPL-3.0（沿用上游）
 
 ---
 
+## 這個套件是從哪裡改來的
 
-![logo](https://github.com/rospogrigio/localtuya-homeassistant/blob/master/img/logo-small.png)
+本倉庫保留了上游完整的 git 歷史（1,308 個提交，從 2019 年的第一個提交開始），每一層的作者紀錄都在。
 
+| 層 | 來源 | 期間 | 說明 |
+|---|---|---|---|
+| 1. 原版 | [rospogrigio/localtuya](https://github.com/rospogrigio/localtuya)（最早由 mileperhour 建立） | 2019-04 起；rospogrigio 最後一次提交在 2023-06 | HA 社群最早的 Tuya 地端整合。協定只支援到 3.4，**不支援網關子設備**，目前已停止維護 |
+| 2. 主線分支 | [xZetsubou/hass-localtuya](https://github.com/xZetsubou/hass-localtuya) | 2023-06 起，約 590 個提交 | 社群公認的接手版本：支援協定 3.5、Zigbee／藍牙子設備（node_id）、用 Cloud API 自動帶入設備與金鑰 |
+| 3. 本倉庫 | WOOWTECH/Woow_ha_localtuya | 2026-09 起 | 以 xZetsubou **2026.07.0**（commit `5eb1939`，2026-09-25）為基礎，修掉網關情境的連線問題並加上一鍵上架 |
 
-__A Home Assistant custom Integration for local handling of Tuya-based devices.__
+**為什麼以 xZetsubou 為基礎：** 原版既不支援 3.5，也不支援網關子設備；xZetsubou 分支兩者都有，而且仍在維護。它原本的子設備支援有一個前提：一台網關底下只有少數設備。在實測案場實際接上一台 55 個子設備的 Zemismart M1 網關後，所有實體每 1–2 分鐘就一起變成「不可用」。本倉庫的修改就是從這裡開始。
 
-### **Usage and setup [Documentation](https://xzetsubou.github.io/hass-localtuya/)**
+與上游的差異：`custom_components/` 12 個檔案（+987／−84 行），另外新增 11 個測試檔。完整清單見 [CHANGELOG_WOOW.md](CHANGELOG_WOOW.md)，逐項說明見 git 歷史中 `5eb1939` 之後的提交。
 
-<br>
+---
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?category=integration&repository=hass-localtuya&owner=xZetsubou)
+## 改了什麼
 
+### 1. 一台網關、多個子設備共用一條連線
+Tuya 網關通常只接受 1–3 個區網連線，所以同一台網關底下的子設備都共用一條連線。原本的程式在「共用」這件事上有幾個缺陷，會互相放大：
 
+- 一個子設備的回覆逾時，會讓整條連線上所有等待中的請求一起失敗。現在只影響那一個。
+- 關閉連線時的處理方式，會讓心跳迴圈誤以為自己被關掉，每 20–35 秒自己斷線一次。已修正。
+- 兩個同時送出的請求可能拿到同一個序號，回覆就會配錯對象。現在分配序號和送出是一體的。
+- 等待睡眠中的電池設備回覆（約 20 秒）時會佔住整條連線，心跳送不出去，網關就斷線。現在等待不佔連線。
+- 網關的「子設備在線清單」是分好幾批回報的（M1 每批約 15 台）。原本把不在這一批的都當成離線；現在看完一整輪才判斷。
+- 挑選「代表網關連線」的子設備時，改為優先挑插電、會回應的設備；網關連線也不再沿用電池設備的睡眠設定。
+- 斷線後，網關連線在同一輪內就會重試，最長只等 10 秒；一般設備仍用 5→60 秒的指數退避。
 
-## __𝐅𝐞𝐚𝐭𝐮𝐫𝐞𝐬__
-- Supported Sub-devices - `Devices that function through gateways`
-- Remote entities - `Supports IR remotes through native remote entity`
-- Auto-configure devices - `Requires a cloud API setup`
-- Automatic insertion - `Some fields requires a cloud API setup`
-- Devices discovery - `Discovers Tuya devices on your network`
-- Cloud API - `Only to help you to setup devices, can work without it.`
+### 2. 以 IP 一鍵上架整台網關（新功能）
+LocalTuya 設定選單多了 **Onboard a gateway and all its sub-devices (by IP)**：
 
+1. 從區網廣播認出網關（Device ID、協定版本）
+2. 用 Cloud API 取得網關金鑰和它底下的子設備清單
+3. 用一條共用連線逐台讀取子設備，自動建立實體
+4. 背景執行並顯示進度，完成後列出成功、失敗、已略過的設備，確認後才寫入
 
+子設備很多的網關要好幾分鐘，所以改成背景執行，網頁不會逾時中斷。情境開關（單擊／雙擊／長按）、紅外線控制器、電池型感應器也能上架。網關本身不會被加入，這是正常的。
 
-<br>
+### 3. 協定 3.3、3.4 的網關
+- **心跳自動偵測：** 先試「子設備在線清單查詢」，網關有回應就用它當心跳，同時可以偵測子設備離線；連續兩次沒回應，就改用一般心跳。原本 3.4 以上的網關若不回應這個查詢，每 20 秒就會斷線一次。
+- **沒有廣播時的版本判斷：** 依 3.5 → 3.4 → 3.3 的順序實際握手驗證，不再把連得上 TCP 當作版本正確。原本任何網關都會被誤判成 3.3。
+- **3.3 的查詢模式：** 一個子設備回傳 `data unvalid` 時，不再切換整條共用連線的查詢方式。
 
-[𝐑𝐞𝐩𝐨𝐫𝐭𝐢𝐧𝐠 𝐚𝐧 𝐢𝐬𝐬𝐮𝐞](https://xzetsubou.github.io/hass-localtuya/report_issue/)
+### 4. 其他修正
+- 燈：調白光或色溫時不再同時送出彩色資料，調彩色時不再同時送出色溫；有些燈泡收到互相矛盾的指令會卡在原本的模式。
+- 3.4/3.5 握手不再吞掉取消訊號，連線逾時能正確生效。
+- 上架時，沒有資料點的設備不會沿用上一台設備的實體。
 
-<!-- ### Notes
+---
 
-* Do not declare anything as "tuya", such as by initiating a "switch.tuya". Using "tuya" launches Home Assistant's built-in, cloud-based Tuya integration in lieu of localtuya.
+## 協定版本支援狀況
 
-* This custom integration updates device status via pushing updates instead of polling, so status updates are fast (even when manually operated).
+| 協定 | 一般 Wi-Fi 設備 | 網關子設備 | 驗證方式 |
+|---|---|---|---|
+| 3.1 / 3.2 | ✓（上游） | 不適用（網關不使用） | 上游 |
+| 3.3 | ✓ | ✓ | 單元測試；**尚未用實機網關驗證** |
+| 3.4 | ✓ | ✓ | 單元測試；**尚未用實機網關驗證** |
+| 3.5 | ✓ | ✓ | 實測案場的 Zemismart M1：53 台子設備，改走有線網路後 15 分鐘 0 次斷線，燈控回應 11–17 毫秒 |
 
-* The integration also supports the Tuya IoT Cloud APIs, for the retrieval of info and of the local_keys of the devices. 
-The Cloud API account configuration is not mandatory (LocalTuya can work also without it) but is strongly suggested for easy retrieval (and auto-update after re-pairing a device) of local_keys. Cloud API calls are performed only at startup, and when a local_key update is needed. -->
+---
 
-<details><summary> 𝐂𝐫𝐞𝐝𝐢𝐭𝐬 </summary>
-<p>
-    
-[rospogrigio](https://github.com/rospogrigio), the original maintainer of LocalTuya. This fork was created when the [upstream](https://github.com/rospogrigio/localtuya) version was at `v5.2.1`.
+## 安裝
 
-[NameLessJedi](https://github.com/NameLessJedi/localtuya-homeassistant) and [mileperhour](https://github.com/mileperhour/localtuya-homeassistant) being the major sources of inspiration, and whose code for switches is substantially unchanged.
+> ⚠️ 本套件和原版、上游的 LocalTuya 使用同一個 domain（`localtuya`），**同一台 HA 只能裝一個**。從上游切換過來時，既有設定會直接沿用。
 
-[TradeFace](https://github.com/TradeFace), for being the only one to provide the correct code for communication with the cover (in particular, the 0x0d command for the status instead of the 0x0a, and related needs such as double reply to be received): 
+**手動安裝**
+1. 把本倉庫的 `custom_components/localtuya` 整個資料夾複製到 HA 的 `/config/custom_components/`
+2. 重新啟動 HA
 
-sean6541, for the working (standard) Python Handler for Tuya devices.
+**HACS**
+HACS → 右上角選單 → 自訂存放庫 → 貼上本倉庫網址，類別選 Integration。HACS 只能使用公開倉庫。
 
-[jasonacox](https://github.com/jasonacox), for the [TinyTuya](https://github.com/jasonacox/tinytuya) project from where I got big help and references to upgrade integration.
+**不要**再從 HACS 預設清單安裝「Local Tuya」。那是原版，會蓋掉本套件。
 
-[uzlonewolf](https://github.com/uzlonewolf), for maintaining TinyTuya who improved the tool so much and introduced new features like new protocols, etc.
+---
 
-[postlund](https://github.com/postlund), for the ideas, for coding 95% of the refactoring and boosting the quality of the upstream repository.
+## 使用：以 IP 上架網關
 
-</p>
-</details> 
+**事前準備（每個專案一次）**
+- Tuya 開發者平台有一個 Smart Home 專案，並在 **裝置 → Link My App** 綁定配對網關用的 App（例如渥屋家庭）
+- 專案的 IoT Core 訂閱在有效期內（只有上架和網關換金鑰時會用到）
+
+**每台 HA 一次：** 設定 → 裝置與服務 → 新增整合 → LocalTuya，填入：
+- 資料中心
+- Client ID／Client Secret（專案的 Access ID／Access Secret）
+- User ID（網關擁有者 App 帳號的 UID）
+
+Access Secret 能讀到這個 App 底下所有設備的金鑰，只能由管理者自己輸入。
+
+**每個案場：**
+1. 用 App 配對網關和子設備，**每台子設備都觸發一次**，例如開關一次、按一下、在感應器前走過
+2. 網關和 HA 在同一個網段，**建議兩者都走有線**
+3. LocalTuya → 設定 → **Onboard a gateway and all its sub-devices (by IP)** → 輸入網關 IP；3.5 網關沒有廣播時，再補上虛擬 ID
+4. 等進度跑完，確認清單後送出
+
+HA 如果只靠 Wi-Fi 連線，延遲高時子設備會時好時壞。實測案場就是改走有線後才完全穩定。
+
+---
+
+## 工具：tools/tuya-gw-onboard
+
+上架前的檢查工具，可以單獨在電腦或 HA 上執行，不需要裝 HA 整合：
+
+```
+tuya-gw-onboard scan   192.168.1.50                        # 從廣播認出網關與協定版本
+tuya-gw-onboard plan   192.168.1.50 --creds tinytuya.json  # 從雲端取得金鑰與子設備清單
+tuya-gw-onboard verify plan.json --out plan.json           # 用一條連線逐台讀取子設備，並判斷協定版本
+tuya-gw-onboard export plan.json                           # 列出 LocalTuya 每個欄位要填什麼
+```
+
+測試新型號的網關（特別是 3.3、3.4）時，建議先跑 `verify`。詳見 [tools/tuya-gw-onboard/README.md](tools/tuya-gw-onboard/README.md)。
+
+---
+
+## 已知限制
+
+- **3.3、3.4 網關還沒有用實機驗證。** 目前的依據是單元測試與社群的實測紀錄。
+- **網關如果不回應子設備在線清單查詢，就無法偵測子設備離線。** 例如 LIDL 3.3 網關會繼續回報設備最後一次的狀態。這是 Zigbee 本身的特性：設備只在狀態改變時傳送，網關也不知道設備斷電了。
+- 3.5 網關的廣播（UDP 7000）目前沒有監聽。3.5 網關沒被自動發現時，需要手動填網關的 Device ID。
+- 只能送不能收的子設備（例如紅外線控制器）斷線重連後，可能一直顯示不可用，待修正。
+- 翻譯目前有英文與簡體中文，還沒有繁體中文。
+
+---
+
+## 開發與測試
+
+```
+pip install -r requirements_test.txt
+pytest -q                 # 整合的測試（tests/）
+black --check . && codespell
+cd tools/tuya-gw-onboard && PYTHONPATH=. python -m pytest -q tests
+```
+
+---
+
+## 授權與致謝
+
+本套件以 GPL-3.0 授權發佈，與上游相同。原始程式碼的著作權屬於各原作者（見 git 歷史），特別感謝 rospogrigio、xZetsubou 以及所有 LocalTuya 貢獻者。本倉庫的修改依 GPLv3 第 5 條標示於 [CHANGELOG_WOOW.md](CHANGELOG_WOOW.md) 與 git 歷史中。
+
+上游的完整使用文件：<https://xzetsubou.github.io/hass-localtuya/>（本倉庫的 `documentation/` 資料夾是其原始檔）。

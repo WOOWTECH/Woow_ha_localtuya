@@ -103,7 +103,7 @@ async def test_keep_alive_does_not_drop_a_gateway_that_ignores_the_query(
 
 def _data_unvalid_reply():
     return AESCipher(LOCAL_KEY.encode()).encrypt(
-        b"json obj data unvalid", use_base64=False
+        b"json obj data unvalid", use_base64=False  # codespell:ignore
     )
 
 

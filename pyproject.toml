@@ -4,7 +4,7 @@ include = 'custom_components/localtuya/.*\.py'
 
 [tool.codespell]
 skip = '*.pyc,*.pyi,*~,*.json'
-ignore-words-list = "hass,contiuation"
+ignore-words-list = "hass,contiuation,unvalid"
 count = true
 quiet-level = 3
 

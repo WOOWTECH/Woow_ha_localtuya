@@ -1,5 +1,5 @@
 {
-  "name": "Local Tuya",
+  "name": "Local Tuya (WoowTech)",
   "homeassistant": "2025.1.0",
   "render_readme": true,
   "persistent_directory": "templates"
